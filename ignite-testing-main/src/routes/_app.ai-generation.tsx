@@ -4,7 +4,6 @@ import {
   Sparkles,
   Loader2,
   RotateCcw,
-  Save,
   ClipboardCheck,
   Upload,
   CircleCheck,
@@ -44,6 +43,10 @@ type TestCase = {
   steps: string | string[];
   expected_result: string;
   status: string;
+  coverage_type?: string | null;
+  ai_quality_score?: number | null;
+  ai_review_remark?: string | null;
+  ai_recommendation?: string | null;
 };
 
 type Project = {
@@ -51,6 +54,8 @@ type Project = {
   name: string;
   description?: string;
 };
+
+type BadgeVariant = "default" | "secondary" | "destructive" | "outline";
 
 const getModuleName = (testcase: TestCase) => {
   if (testcase.module && testcase.module.trim() !== "") {
@@ -101,9 +106,8 @@ const getModuleWiseTcId = (cases: TestCase[], index: number) => {
 
   const moduleCount = cases
     .slice(0, index + 1)
-    .filter(
-      (tc) => getModulePrefix(getModuleName(tc)) === currentPrefix
-    ).length;
+    .filter((tc) => getModulePrefix(getModuleName(tc)) === currentPrefix)
+    .length;
 
   return `TC-${currentPrefix}-${String(moduleCount).padStart(3, "0")}`;
 };
@@ -114,6 +118,43 @@ const formatSteps = (steps: string | string[]) => {
   }
 
   return steps || "";
+};
+
+const getAiDecision = (testcase: TestCase) => {
+  if (testcase.ai_recommendation && testcase.ai_recommendation.trim() !== "") {
+    return testcase.ai_recommendation;
+  }
+
+  if (["Approved", "Passed", "Failed", "Blocked"].includes(testcase.status)) {
+    return "Auto Approved";
+  }
+
+  if (testcase.status === "Rejected") {
+    return "Auto Rejected";
+  }
+
+  if (testcase.status === "Review") {
+    return "Needs Review";
+  }
+
+  return "Manual Review";
+};
+
+const getStatusBadgeVariant = (status: string): BadgeVariant => {
+  if (status === "Rejected") return "destructive";
+  if (["Approved", "Passed", "Failed", "Blocked"].includes(status)) return "default";
+  if (status === "Review") return "secondary";
+  return "outline";
+};
+
+const getDecisionBadgeVariant = (decision: string): BadgeVariant => {
+  const text = decision.toLowerCase();
+
+  if (text.includes("reject")) return "destructive";
+  if (text.includes("approved")) return "default";
+  if (text.includes("review")) return "secondary";
+
+  return "outline";
 };
 
 function AIGenerationPage() {
@@ -134,30 +175,22 @@ function AIGenerationPage() {
     if (!projectId) return;
 
     try {
-      const response = await fetch(`${API_URL}/projects/${projectId}/summary`);
+      const response = await fetch(`${API_URL}/testcases`);
       const data = await response.json();
 
       if (!response.ok || data.error) {
-  throw new Error(data.details || data.error || "AI generation failed");
-}
+        throw new Error(data.details || data.error || "Failed to load test cases");
+      }
 
-if (data.generated_testcases && data.generated_testcases.length > 0) {
-  toast.success(`${data.generated_testcases.length} new unique test cases generated.`);
-} else {
-  toast.warning("No new unique test cases found. Existing duplicates were skipped.");
-}
+      const projectTestCases = Array.isArray(data)
+        ? data.filter(
+            (testcase) => String(testcase.project_id) === String(projectId)
+          )
+        : [];
 
-if (data.skipped_duplicates && data.skipped_duplicates > 0) {
-  toast.info(`${data.skipped_duplicates} duplicate test cases skipped.`);
-}
-
-if (selectedProjectId) {
-  await loadExistingTestCases(selectedProjectId);
-}
-
-      setGenerated(Array.isArray(data.testcases) ? data.testcases : []);
-    } catch {
-      toast.error("Failed to load existing test cases");
+      setGenerated(projectTestCases);
+    } catch (error: any) {
+      toast.error(error.message || "Failed to load existing test cases");
     }
   };
 
@@ -208,14 +241,24 @@ if (selectedProjectId) {
           existingProject.name || savedProjectName
         );
 
-        loadExistingTestCases(savedProjectId);
+        await loadExistingTestCases(savedProjectId);
+        return;
       }
+
+      const firstProject = projectList[0];
+      setSelectedProjectId(String(firstProject.id));
+      setSelectedProjectName(firstProject.name);
+
+      window.localStorage.setItem("selectedProjectId", String(firstProject.id));
+      window.localStorage.setItem("selectedProjectName", firstProject.name);
+
+      await loadExistingTestCases(String(firstProject.id));
     } catch {
       toast.error("Failed to load projects");
     }
   };
 
-  const handleProjectChange = (projectId: string) => {
+  const handleProjectChange = async (projectId: string) => {
     setSelectedProjectId(projectId);
     setDocumentId("");
     setSelectedFile(null);
@@ -231,7 +274,7 @@ if (selectedProjectId) {
       window.localStorage.setItem("selectedProjectId", String(project.id));
       window.localStorage.setItem("selectedProjectName", project.name);
 
-      loadExistingTestCases(projectId);
+      await loadExistingTestCases(projectId);
     }
   };
 
@@ -280,12 +323,8 @@ if (selectedProjectId) {
   };
 
   useEffect(() => {
-    const savedDocId =
-      window.localStorage.getItem("selectedDocumentId") || "";
-
-    const savedProjectId =
-      window.localStorage.getItem("selectedProjectId") || "";
-
+    const savedDocId = window.localStorage.getItem("selectedDocumentId") || "";
+    const savedProjectId = window.localStorage.getItem("selectedProjectId") || "";
     const savedProjectName =
       window.localStorage.getItem("selectedProjectName") || "";
 
@@ -294,9 +333,6 @@ if (selectedProjectId) {
   }, []);
 
   const generate = async () => {
-    
-
-
     if (!documentId) {
       toast.error("Please upload SRS/SOW PDF first.");
       return;
@@ -321,13 +357,29 @@ if (selectedProjectId) {
         throw new Error(data.details || data.error || "AI generation failed");
       }
 
-      if (data.generated_testcases && data.generated_testcases.length > 0) {
-        setGenerated(data.generated_testcases);
-      } else if (selectedProjectId) {
+      if (selectedProjectId) {
         await loadExistingTestCases(selectedProjectId);
       }
 
-      toast.success("Test cases generated successfully");
+      const newCount = Array.isArray(data.generated_testcases)
+        ? data.generated_testcases.length
+        : 0;
+
+      if (newCount > 0) {
+        toast.success(`${newCount} test cases generated, validated, and auto-classified.`);
+      } else {
+        toast.warning("No new unique test cases found. Existing duplicates were skipped.");
+      }
+
+      if (typeof data.auto_approved_count === "number") {
+        toast.info(
+          `Auto Approved: ${data.auto_approved_count} | Review: ${data.needs_review_count || 0} | Rejected: ${data.auto_rejected_count || 0}`
+        );
+      }
+
+      if (data.skipped_duplicates && data.skipped_duplicates > 0) {
+        toast.info(`${data.skipped_duplicates} duplicate test cases skipped.`);
+      }
     } catch (error: any) {
       console.error("Generation error:", error);
       toast.error(error.message || "Failed to generate test cases");
@@ -355,47 +407,27 @@ if (selectedProjectId) {
         throw new Error(data.error || "Status update failed");
       }
 
+      const updatedTestcase = data.testcase;
+
       setGenerated((prev) =>
         prev.map((testcase) =>
-          testcase.id === testcaseId ? { ...testcase, status } : testcase
+          testcase.id === testcaseId
+            ? {
+                ...testcase,
+                ...(updatedTestcase || {}),
+                status,
+              }
+            : testcase
         )
       );
 
       toast.success(
         status === "Approved"
-          ? "Test case approved and moved to Execution"
-          : "Test case rejected"
+          ? "Review case approved and moved to Execution"
+          : "Review case rejected"
       );
     } catch (error: any) {
       toast.error(error.message || "Failed to update test case status");
-    }
-  };
-
-  const saveDraft = async () => {
-    if (generated.length === 0) {
-      toast.error("Nothing to save yet");
-      return;
-    }
-
-    try {
-      await Promise.all(
-        generated.map((testcase) =>
-          fetch(`${API_URL}/testcases/${testcase.id}/draft`, {
-            method: "PUT",
-          })
-        )
-      );
-
-      setGenerated((prev) =>
-        prev.map((testcase) => ({
-          ...testcase,
-          status: "Draft",
-        }))
-      );
-
-      toast.success("Generated test cases saved as Draft");
-    } catch {
-      toast.error("Failed to save as Draft");
     }
   };
 
@@ -414,6 +446,164 @@ if (selectedProjectId) {
     return a.id - b.id;
   });
 
+  const autoApprovedCases = displayedTestCases.filter((testcase) =>
+    ["Approved", "Passed", "Failed", "Blocked"].includes(testcase.status)
+  );
+
+  const needsReviewCases = displayedTestCases.filter((testcase) =>
+    ["Review", "Generated", "Draft"].includes(testcase.status)
+  );
+
+  const autoRejectedCases = displayedTestCases.filter(
+    (testcase) => testcase.status === "Rejected"
+  );
+
+  const getDisplayTcId = (testcase: TestCase) => {
+    const index = displayedTestCases.findIndex((tc) => tc.id === testcase.id);
+    if (index === -1) return `TC-${String(testcase.id).padStart(3, "0")}`;
+    return getModuleWiseTcId(displayedTestCases, index);
+  };
+
+  const renderTestCaseSection = (
+    title: string,
+    description: string,
+    sectionCases: TestCase[],
+    emptyText: string,
+    showManualActions: boolean
+  ) => (
+    <Card className="overflow-hidden">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border p-4">
+        <div>
+          <h3 className="text-sm font-semibold">{title}</h3>
+          <p className="text-xs text-muted-foreground">{description}</p>
+        </div>
+
+        <Badge variant="outline">{sectionCases.length} cases</Badge>
+      </div>
+
+      {sectionCases.length === 0 ? (
+        <div className="p-8 text-center text-sm text-muted-foreground">
+          {emptyText}
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
+          <Table className="min-w-[1450px]">
+            <TableHeader>
+              <TableRow>
+                <TableHead>TC ID</TableHead>
+                <TableHead>Project ID</TableHead>
+                <TableHead>Module</TableHead>
+                <TableHead>Scenario</TableHead>
+                <TableHead className="min-w-[280px]">Steps</TableHead>
+                <TableHead className="min-w-[260px]">Expected Result</TableHead>
+                <TableHead>Coverage</TableHead>
+                <TableHead>AI Score</TableHead>
+                <TableHead>AI Decision</TableHead>
+                <TableHead className="min-w-[260px]">AI Remark</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead className="text-center">Action</TableHead>
+              </TableRow>
+            </TableHeader>
+
+            <TableBody>
+              {sectionCases.map((testcase) => {
+                const decision = getAiDecision(testcase);
+
+                return (
+                  <TableRow key={testcase.id}>
+                    <TableCell className="font-mono text-xs">
+                      {getDisplayTcId(testcase)}
+                    </TableCell>
+
+                    <TableCell>{testcase.project_id}</TableCell>
+
+                    <TableCell>
+                      <Badge variant="secondary">{getModuleName(testcase)}</Badge>
+                    </TableCell>
+
+                    <TableCell className="max-w-[220px]">
+                      {testcase.title}
+                    </TableCell>
+
+                    <TableCell className="whitespace-pre-line text-xs">
+                      {formatSteps(testcase.steps)}
+                    </TableCell>
+
+                    <TableCell className="text-xs">
+                      {testcase.expected_result}
+                    </TableCell>
+
+                    <TableCell>
+                      <Badge variant="outline">
+                        {testcase.coverage_type || "Functional"}
+                      </Badge>
+                    </TableCell>
+
+                    <TableCell className="font-medium">
+                      {typeof testcase.ai_quality_score === "number"
+                        ? `${testcase.ai_quality_score}/100`
+                        : "—"}
+                    </TableCell>
+
+                    <TableCell>
+                      <Badge variant={getDecisionBadgeVariant(decision)}>
+                        {decision}
+                      </Badge>
+                    </TableCell>
+
+                    <TableCell className="text-xs">
+                      {testcase.ai_review_remark || "AI validation remark not available."}
+                    </TableCell>
+
+                    <TableCell>
+                      <Badge variant={getStatusBadgeVariant(testcase.status)}>
+                        {testcase.status}
+                      </Badge>
+                    </TableCell>
+
+                    <TableCell className="text-center">
+                      {showManualActions ? (
+                        <div className="flex justify-center gap-2">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() =>
+                              updateTestCaseStatus(testcase.id, "Approved")
+                            }
+                            title="Approve review case"
+                            className="h-10 w-10 rounded-xl shadow-sm"
+                          >
+                            <CircleCheck className="h-5 w-5" />
+                          </Button>
+
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() =>
+                              updateTestCaseStatus(testcase.id, "Rejected")
+                            }
+                            title="Reject review case"
+                            className="h-10 w-10 rounded-xl shadow-sm"
+                          >
+                            <CircleX className="h-5 w-5" />
+                          </Button>
+                        </div>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">
+                          Auto handled
+                        </span>
+                      )}
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+    </Card>
+  );
+
   return (
     <div className="space-y-6">
       <div>
@@ -429,8 +619,8 @@ if (selectedProjectId) {
         )}
 
         <p className="text-sm text-muted-foreground">
-          Generate test cases from uploaded SRS/SOW documents and approve or
-          reject them for execution.
+          Generate test cases from uploaded SRS/SOW documents. AI will validate
+          them automatically and classify them as Approved, Review, or Rejected.
         </p>
       </div>
 
@@ -501,34 +691,16 @@ if (selectedProjectId) {
         </div>
 
         <div className="mt-4 flex flex-wrap gap-2">
-          <Button
-            onClick={generate}
-            disabled={loading || !documentId}
-          >
+          <Button onClick={generate} disabled={loading || !documentId}>
             {loading ? (
               <>
                 <Loader2 className="h-4 w-4 animate-spin" />
-                Generating test cases...
+                AI is generating and validating...
               </>
             ) : generated.length > 0 ? (
               <>
-                <ClipboardCheck className="h-4 w-4" />
-                {loading ? (
-  <>
-    <Loader2 className="h-4 w-4 animate-spin" />
-    AI is generating test cases…
-  </>
-) : generated.length > 0 ? (
-  <>
-    <Sparkles className="h-4 w-4" />
-    Generate More Test Cases
-  </>
-) : (
-  <>
-    <Sparkles className="h-4 w-4" />
-    Generate Test Cases
-  </>
-)}
+                <Sparkles className="h-4 w-4" />
+                Generate More Test Cases
               </>
             ) : (
               <>
@@ -539,11 +711,7 @@ if (selectedProjectId) {
           </Button>
 
           <Button variant="outline" onClick={generate} disabled={loading || !documentId}>
-  <RotateCcw className="h-4 w-4" /> Regenerate
-</Button>
-
-          <Button variant="outline" onClick={saveDraft}>
-            <Save className="h-4 w-4" /> Save as Draft
+            <RotateCcw className="h-4 w-4" /> Regenerate
           </Button>
 
           <Button variant="secondary" onClick={goExecution}>
@@ -552,23 +720,18 @@ if (selectedProjectId) {
         </div>
       </Card>
 
-      <Card className="overflow-hidden">
-        <div className="flex items-center justify-between border-b border-border p-4">
-          <h3 className="text-sm font-semibold">Generated test cases</h3>
-          {generated.length > 0 && (
-            <Badge variant="outline">{generated.length} generated</Badge>
-          )}
-        </div>
-
-        {loading ? (
+      {loading ? (
+        <Card>
           <div className="flex flex-col items-center justify-center gap-3 p-16 text-sm text-muted-foreground">
             <Loader2 className="h-8 w-8 animate-spin text-primary" />
-            <div>Generating test cases from the uploaded SRS/SOW...</div>
+            <div>Generating and validating test cases from the uploaded SRS/SOW...</div>
             <div className="text-xs">
-              Reading requirements · Detecting scenarios · Creating test cases
+              Reading requirements · Creating test cases · Checking requirement match · Auto-classifying
             </div>
           </div>
-        ) : generated.length === 0 ? (
+        </Card>
+      ) : displayedTestCases.length === 0 ? (
+        <Card>
           <div className="p-16 text-center text-sm text-muted-foreground">
             No test cases yet. Click{" "}
             <span className="font-medium text-foreground">
@@ -576,84 +739,66 @@ if (selectedProjectId) {
             </span>{" "}
             to begin.
           </div>
-        ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>TC ID</TableHead>
-                <TableHead>Project ID</TableHead>
-                <TableHead>Module</TableHead>
-                <TableHead>Scenario</TableHead>
-                <TableHead className="min-w-[300px]">Steps</TableHead>
-                <TableHead>Expected Result</TableHead>
-                <TableHead className="text-center">Approve / Reject</TableHead>
-              </TableRow>
-            </TableHeader>
+        </Card>
+      ) : (
+        <>
+          <div className="grid gap-3 md:grid-cols-3">
+            <Card className="p-4">
+              <div className="text-xs text-muted-foreground">Auto Approved</div>
+              <div className="mt-1 text-2xl font-semibold">
+                {autoApprovedCases.length}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Directly available in Execution
+              </p>
+            </Card>
 
-            <TableBody>
-              {displayedTestCases.map((testcase, index) => (
-                <TableRow key={testcase.id}>
-                  <TableCell className="font-mono text-xs">
-                    {getModuleWiseTcId(displayedTestCases, index)}
-                  </TableCell>
+            <Card className="p-4">
+              <div className="text-xs text-muted-foreground">Needs Review</div>
+              <div className="mt-1 text-2xl font-semibold">
+                {needsReviewCases.length}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Tester checks only these doubtful cases
+              </p>
+            </Card>
 
-                  <TableCell>{testcase.project_id}</TableCell>
+            <Card className="p-4">
+              <div className="text-xs text-muted-foreground">Auto Rejected</div>
+              <div className="mt-1 text-2xl font-semibold">
+                {autoRejectedCases.length}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Irrelevant, duplicate, or weak cases
+              </p>
+            </Card>
+          </div>
 
-                  <TableCell>
-                    <Badge variant="secondary">{getModuleName(testcase)}</Badge>
-                  </TableCell>
+          {renderTestCaseSection(
+            "Auto Approved Test Cases",
+            "AI found these cases clear, traceable, executable, and ready for execution.",
+            autoApprovedCases,
+            "No auto-approved test cases found.",
+            false
+          )}
 
-                  <TableCell className="max-w-[220px]">
-                    {testcase.title}
-                  </TableCell>
+          {renderTestCaseSection(
+            "Needs Review",
+            "Only these doubtful cases require tester decision.",
+            needsReviewCases,
+            "No test cases need manual review.",
+            true
+          )}
 
-                  <TableCell className="whitespace-pre-line text-xs">
-                    {formatSteps(testcase.steps)}
-                  </TableCell>
-
-                  <TableCell className="text-xs">
-                    {testcase.expected_result}
-                  </TableCell>
-
-                  <TableCell className="text-center">
-                    <div className="flex justify-center gap-2">
-                      <Button
-                        size="sm"
-                        variant={
-                          testcase.status === "Approved" ? "default" : "outline"
-                        }
-                        onClick={() =>
-                          updateTestCaseStatus(testcase.id, "Approved")
-                        }
-                        title="Approve test case"
-                        className="h-11 w-11 rounded-xl shadow-sm"
-                      >
-                        <CircleCheck className="h-5 w-5" />
-                      </Button>
-
-                      <Button
-                        size="sm"
-                        variant={
-                          testcase.status === "Rejected"
-                            ? "destructive"
-                            : "outline"
-                        }
-                        onClick={() =>
-                          updateTestCaseStatus(testcase.id, "Rejected")
-                        }
-                        title="Reject test case"
-                        className="h-11 w-11 rounded-xl shadow-sm"
-                      >
-                        <CircleX className="h-5 w-5" />
-                      </Button>
-                    </div>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        )}
-      </Card>
+          {renderTestCaseSection(
+            "Auto Rejected Test Cases",
+            "AI rejected these because they are irrelevant, duplicate, unclear, or not traceable to the SRS/SOW.",
+            autoRejectedCases,
+            "No auto-rejected test cases found.",
+            false
+          )}
+        </>
+      )}
     </div>
   );
 }

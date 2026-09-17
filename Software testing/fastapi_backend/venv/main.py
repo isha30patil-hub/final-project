@@ -9,9 +9,11 @@ import json
 import re
 import google.generativeai as genai
 import os
+import requests
 from dotenv import load_dotenv
 from openai import OpenAI
 import anthropic
+from typing import Optional
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 
@@ -57,17 +59,90 @@ def get_db_connection():
         cursor_factory=RealDictCursor
     )
 
+def ensure_testcase_ai_columns(cur):
+    """
+    Keeps old database compatible and adds AI validation columns automatically.
+    Safe to run multiple times.
+    """
+    cur.execute("""
+        ALTER TABLE testcases
+        ADD COLUMN IF NOT EXISTS module VARCHAR(100),
+        ADD COLUMN IF NOT EXISTS coverage_type VARCHAR(50),
+        ADD COLUMN IF NOT EXISTS ai_quality_score INTEGER,
+        ADD COLUMN IF NOT EXISTS ai_review_remark TEXT,
+        ADD COLUMN IF NOT EXISTS ai_recommendation VARCHAR(20);
+    """)
+
+def normalize_for_duplicate(value):
+    if value is None:
+        return ""
+    return " ".join(str(value).lower().strip().split())
+
+def safe_int(value, default=70):
+    try:
+        score = int(float(value))
+        return max(0, min(100, score))
+    except Exception:
+        return default
+
+def to_boolean(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in ["true", "yes", "y", "1", "matched", "match"]
+
+def decide_auto_status(requirement_match, ai_quality_score):
+    """
+    Automation rule:
+    - Good matching cases go directly to Execution as Approved.
+    - Doubtful cases stay as Review.
+    - Wrong/irrelevant cases are Rejected.
+    """
+    if requirement_match and ai_quality_score >= 85:
+        return "Approved"
+    if requirement_match and ai_quality_score >= 60:
+        return "Review"
+    return "Rejected"
+
+def build_ai_recommendation(status):
+    if status == "Approved":
+        return "Auto Approved"
+    if status == "Review":
+        return "Needs Review"
+    return "Auto Rejected"
+
+def get_json_case_list(parsed):
+    """
+    Gemini/OpenAI/Claude may sometimes return either a list or an object.
+    This helper extracts the test case list safely.
+    """
+    if isinstance(parsed, list):
+        return parsed
+
+    if isinstance(parsed, dict):
+        for key in ["testcases", "test_cases", "generated_testcases", "validated_testcases", "cases"]:
+            value = parsed.get(key)
+            if isinstance(value, list):
+                return value
+
+    return []
+
 class Project(BaseModel):
     name: str
     description: str
 
 class TestCase(BaseModel):
     project_id: int
-    module: str
+    module: str = "General"
     title: str
     steps: str
     expected_result: str
-    status: str
+    status: str = "Generated"
+    coverage_type: Optional[str] = None
+    ai_quality_score: Optional[int] = None
+    ai_review_remark: Optional[str] = None
+    ai_recommendation: Optional[str] = None
 
 class Defect(BaseModel):
     testcase_id: int
@@ -198,7 +273,7 @@ def get_testcases():
     cur.execute("""
         SELECT *
         FROM testcases
-        WHERE status IN ('Generated', 'Approved', 'Rejected', 'Draft', 'Passed', 'Failed', 'Blocked')
+        WHERE status IN ('Generated', 'Approved', 'Review', 'Rejected', 'Draft', 'Passed', 'Failed', 'Blocked')
         ORDER BY id ASC;
     """)
     testcases = cur.fetchall()
@@ -211,14 +286,23 @@ def update_testcase_status(testcase_id: int, status_update: StatusUpdate):
     conn = get_db_connection()
     cur = conn.cursor()
 
+    ensure_testcase_ai_columns(cur)
+
+    manual_recommendation = status_update.status
+    if status_update.status == "Approved":
+        manual_recommendation = "Manual Approved"
+    elif status_update.status == "Rejected":
+        manual_recommendation = "Manual Rejected"
+
     cur.execute(
         """
         UPDATE testcases
-        SET status = %s
+        SET status = %s,
+            ai_recommendation = %s
         WHERE id = %s
         RETURNING *;
         """,
-        (status_update.status, testcase_id)
+        (status_update.status, manual_recommendation, testcase_id)
     )
 
     updated_testcase = cur.fetchone()
@@ -239,11 +323,25 @@ def update_testcase_status(testcase_id: int, status_update: StatusUpdate):
 def create_testcase(testcase: TestCase):
     conn = get_db_connection()
     cur = conn.cursor()
+
+    ensure_testcase_ai_columns(cur)
+
     cur.execute(
         """
         INSERT INTO testcases
-        (project_id, title, steps, expected_result, status)
-        VALUES (%s, %s, %s, %s, %s)
+        (
+            project_id,
+            module,
+            title,
+            steps,
+            expected_result,
+            status,
+            coverage_type,
+            ai_quality_score,
+            ai_review_remark,
+            ai_recommendation
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING *;
         """,
         (
@@ -253,6 +351,10 @@ def create_testcase(testcase: TestCase):
             testcase.steps,
             testcase.expected_result,
             testcase.status,
+            testcase.coverage_type,
+            testcase.ai_quality_score,
+            testcase.ai_review_remark,
+            testcase.ai_recommendation,
         )
     )
     new_testcase = cur.fetchone()
@@ -633,9 +735,37 @@ def generate_ai_response(prompt: str):
         if not GEMINI_API_KEY:
             raise Exception("Gemini API key is missing")
 
-        gemini_model = genai.GenerativeModel(GEMINI_MODEL)
-        response = gemini_model.generate_content(prompt)
-        return response.text
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY,
+        }
+
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt}
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.2
+            }
+        }
+
+        response = requests.post(url, headers=headers, json=payload, timeout=120)
+
+        if response.status_code != 200:
+            raise Exception(response.text)
+
+        data = response.json()
+
+        try:
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception:
+            raise Exception(f"Gemini response text not found: {data}")
 
     if AI_PROVIDER == "openai":
         if not openai_client:
@@ -666,209 +796,3 @@ def generate_ai_response(prompt: str):
         return response.content[0].text
 
     raise Exception("Invalid AI provider selected")
-
-@app.post("/defects")
-def create_defect(defect: Defect):
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    try:
-        # Check if defect already exists for same test case
-        cur.execute(
-            """
-            SELECT *
-            FROM defects
-            WHERE testcase_id = %s
-            LIMIT 1;
-            """,
-            (defect.testcase_id,)
-        )
-
-        existing_defect = cur.fetchone()
-
-        if existing_defect:
-            return {
-                "message": "Defect already exists for this test case",
-                "defect": existing_defect
-            }
-
-        cur.execute(
-            """
-            INSERT INTO defects
-            (testcase_id, defect_title, severity, status)
-            VALUES (%s, %s, %s, %s)
-            RETURNING *;
-            """,
-            (
-                defect.testcase_id,
-                defect.defect_title,
-                defect.severity,
-                defect.status,
-            )
-        )
-
-        new_defect = cur.fetchone()
-        conn.commit()
-
-        return new_defect
-
-    except Exception as e:
-        conn.rollback()
-        return {
-            "error": "Failed to create defect",
-            "details": str(e)
-        }
-
-    finally:
-        cur.close()
-        conn.close()
-
-@app.post("/generate-testcases")
-def generate_testcases(request: GenerateTestCasesRequest):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    cur.execute("SELECT * FROM documents WHERE id = %s;", (request.document_id,))
-    document = cur.fetchone()
-
-    if not document:
-        cur.close()
-        conn.close()
-        return {"error": "Document not found"}
-
-    project_id = document["project_id"]
-    
-    extracted_text = document["extracted_text"]
-
-    prompt = f"""
-You are a senior software QA engineer.
-
-Read the following SRS/SOW requirement document text and generate complete software test cases.
-
-Return ONLY a valid JSON array. Do not include markdown, explanation, comments, or extra text.
-
-Important rules:
-1. Do not skip any functional requirement.
-2. Do not skip any validation rule.
-3. Generate at least one test case for every important requirement and validation point.
-4. Generate positive, negative, boundary, and validation test cases.
-5. Group test cases module-wise.
-6. Do not generate test cases outside the scope of the given SRS/SOW.
-7. Generate 18 to 22 test cases if required to cover the document properly.
-
-Each test case must have:
-- module
-- title
-- steps
-- expected_result
-- status
-
-Use only these modules if they are present in the requirement:
-- Login / Registration
-- Shopping Cart
-- Payment
-- Search
-- Profile
-- General
-
-For this document, ensure coverage for:
-- Valid user registration
-- Registration with empty mandatory fields
-- Registration with invalid email format
-- Registration with invalid mobile number
-- Duplicate email registration
-- Password mismatch
-- Password less than minimum length
-- Valid user login
-- Login with incorrect password
-- Login with empty email or password
-- Login with invalid email format
-- Add product to cart as logged-in user
-- Add product to cart as logged-out user
-- Add out-of-stock product to cart
-- Update product quantity
-- Prevent quantity less than 1
-- Remove product from cart
-- Empty cart validation
-- Verify cart total calculation
-- Verify cart displays product name, price, quantity, and total amount
-
-Use status as "Generated".
-
-Return JSON in this format:
-[
-  {{
-    "module": "Login / Registration",
-    "title": "Test case title",
-    "steps": [
-      "Step 1",
-      "Step 2",
-      "Step 3"
-    ],
-    "expected_result": "Expected result here",
-    "status": "Generated"
-  }}
-]
-
-""
-SRS/SOW Text:
-{extracted_text[:12000]}
-"""
-
-    
-    try:
-        ai_text = generate_ai_response(prompt)
-    except Exception as e:
-        cur.close()
-        conn.close()
-        return {
-            "error": "AI generation failed",
-            "details": str(e)
-        }
-    try:
-        generated_cases = extract_json_from_ai_response(ai_text)
-    except Exception as e:
-        cur.close()
-        conn.close()
-        return {
-            "error": "AI response could not be parsed as JSON",
-            "raw_ai_response": ai_text,
-            "details": str(e)
-        }
-
-    saved_cases = []
-
-    for case in generated_cases:
-        steps = case.get("steps", "")
-        if isinstance(steps, list):
-            steps = "\n".join(steps)
-
-        cur.execute(
-            """
-            INSERT INTO testcases
-(project_id, module, title, steps, expected_result, status)
-VALUES (%s, %s, %s, %s, %s, %s)
-RETURNING *;
-            """,
-            (
-    project_id,
-    case.get("module", "General"),
-    case.get("title", "Untitled Test Case"),
-    steps,
-    case.get("expected_result", ""),
-    case.get("status", "Generated"),
-)
-        )
-        saved_cases.append(cur.fetchone())
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    return {
-        "message": "AI-generated test cases created successfully from uploaded document",
-        "document_id": request.document_id,
-        "generated_testcases": saved_cases
-    }
-
-    
