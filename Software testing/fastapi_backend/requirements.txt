@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-multipart
+psycopg2-binary
+PyPDF2
+python-dotenv
+requests
+pydantic
+google-generativeai
+openai
+anthropic
