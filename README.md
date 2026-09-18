@@ -120,14 +120,13 @@ later, credentials saved under the old key can no longer be decrypted — re-ent
 
 ```bash
 createdb testai      # or create it via your Postgres client of choice
-psql testai -f schema.sql
+python migrate.py
 ```
 
-[`schema.sql`](Software%20testing/fastapi_backend/schema.sql) is the full from-scratch
-schema. The backend **also** applies additive migrations automatically on every startup
-(`ensure_execution_schema()` in `main.py`: `CREATE TABLE IF NOT EXISTS` / `ADD COLUMN IF
-NOT EXISTS`), so a database created before the execution pipeline existed is upgraded in
-place the first time you boot the new backend — no manual migration step.
+`migrate.py` builds the schema from the files in `migrations/`. It is also run on every
+backend startup, so after pulling new code you just restart — **you never need to drop,
+dump or restore the database to pick up a schema change.** How it works, and how to add
+a migration, is in [Database migrations](#database-migrations) below.
 
 ### Run the backend
 
@@ -218,6 +217,8 @@ API elsewhere).
 | `schemas.py` | Pydantic models that AI output is validated against (`AITestCase`, `CoverageResult`, `FailureAnalysis`) |
 | `browser_exploration.py` | Playwright visit of the Website URL that captures the page's accessibility tree for codegen |
 | `crypto.py` | Fernet encrypt/decrypt for stored credentials + `mask_secrets()` |
+| `migrate.py` | Applies pending `migrations/*.sql` files; run on startup and by hand (`python migrate.py`) |
+| `migrations/` | The database schema, as numbered idempotent SQL files — the only place the schema is defined |
 
 ### Test-case generation
 A senior-QA-architect system prompt asks the model for structured cases (module, feature,
@@ -263,6 +264,64 @@ New tables: `generated_scripts`, `test_executions`, `test_step_results`, `test_a
 `requires_credentials`, `latest_execution_status`, `latest_execution_id`. Automated runs
 never overwrite `testcases.status` (the approval workflow) — they update
 `latest_execution_*` instead.
+
+### Database migrations
+
+The schema is defined in exactly one place: the numbered SQL files in
+[`migrations/`](Software%20testing/fastapi_backend/migrations), applied by
+[`migrate.py`](Software%20testing/fastapi_backend/migrate.py).
+
+**How it runs** — on every backend startup, and whenever you run `python migrate.py`:
+
+1. Creates the `schema_migrations` table if it doesn't exist (`version`, `applied_at`).
+2. Reads which versions are already recorded there.
+3. Runs every `migrations/*.sql` whose filename (minus `.sql`) is not recorded — in
+   filename order, each in its own transaction — and records it on success.
+
+A migration that fails is rolled back, its version is **not** recorded, later files are not
+attempted, and startup aborts with the Postgres error. The app therefore never runs
+against a half-migrated database, and fixing the file and restarting simply re-runs it.
+
+`001_baseline.sql` is the entire current schema written idempotently, so on an empty
+database it builds everything, and on an existing database it only adds whatever is missing.
+
+**Adding a migration — worked example.** Say test cases need a `tags` column. Create
+`migrations/002_testcases_tags.sql`:
+
+```sql
+ALTER TABLE testcases
+    ADD COLUMN IF NOT EXISTS tags TEXT[] NOT NULL DEFAULT '{}';
+```
+
+Restart the backend, or run it by hand:
+
+```bash
+cd "Software testing/fastapi_backend"
+python migrate.py
+# Applied: 002_testcases_tags
+```
+
+Run it again and it reports `Database already up to date.` Every other developer (and
+UAT) gets the column the next time their backend starts.
+
+**Rules:**
+
+- **Number sequentially** — `002_`, `003_`, … Order is by filename, so the number is what
+  guarantees your migration runs after the ones it depends on. The rest of the name says
+  what it does.
+- **Write idempotently** — `CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`,
+  `CREATE INDEX IF NOT EXISTS`. Then a file that was applied by hand, or half-applied
+  outside the runner, is harmless to run again.
+- **`NOT NULL` needs a `DEFAULT`** when the table already has rows, or Postgres rejects
+  the `ALTER`.
+- **Never edit or renumber a migration that has been applied anywhere** — another
+  developer's machine, UAT, production. The runner sees the version as done and will not
+  re-run it, so the edit silently never lands. Add a new file that alters what you need.
+- **One purpose per file.** Several statements are fine (add a table *and* its index);
+  unrelated changes are not. Data fixes (`UPDATE …`) belong in a migration too.
+
+**Seeing what's applied:** `python migrate.py` (prints what it applied or that it's up to
+date), or in psql: `SELECT * FROM schema_migrations ORDER BY version;`
 
 ---
 
@@ -348,6 +407,17 @@ Playwright's browser instance is still starting up on backend boot; wait a few s
 
 **Run finished as `ERROR` with "Server restarted mid-run"**
 The backend restarted while that run was in progress. Just run the test case again.
+
+**Backend won't start: "Migration 00N_… failed and was rolled back"**
+That SQL file has an error — the Postgres message is printed right after it. Nothing from
+the file was applied and later files were not attempted. Fix the file and start again; since
+the version was never recorded, it re-runs from the top.
+
+**`column "…" does not exist` / `relation "…" does not exist` after pulling new code**
+The code expects a migration that hasn't run on your database. Restart the backend (it
+migrates on startup) or run `python migrate.py` in `fastapi_backend`. If that reports
+"already up to date", someone changed the schema without adding a migration file — write
+one (see [Database migrations](#database-migrations)).
 
 **The project page shows the Projects list instead of the project**
 Fixed — the detail route used to be nested under the list route and never rendered. If you
