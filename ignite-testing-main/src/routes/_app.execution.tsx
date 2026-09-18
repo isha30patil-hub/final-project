@@ -7,8 +7,11 @@ import {
   CircleAlert,
   MessageSquarePlus,
   Bug,
+  Code2,
 } from "lucide-react";
 import { toast } from "sonner";
+import { API_URL } from "@/lib/api";
+import { useExecutionSocket } from "@/hooks/use-execution-socket";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -44,8 +47,6 @@ export const Route = createFileRoute("/_app/execution")({
   component: ExecutionPage,
 });
 
-const API_URL = "http://127.0.0.1:8000";
-
 type TestCase = {
   id: number;
   project_id: number;
@@ -53,14 +54,26 @@ type TestCase = {
   title: string;
   steps: string;
   expected_result: string;
-  status:
-    | "Generated"
-    | "Approved"
-    | "Rejected"
-    | "Draft"
-    | "Passed"
-    | "Failed"
-    | "Blocked";
+  status: "Generated" | "Approved" | "Rejected" | "Draft" | "Passed" | "Failed" | "Blocked";
+  automatable?: boolean;
+  latest_execution_status?: string | null;
+};
+
+const executionBadgeVariant = (status?: string | null) => {
+  switch (status) {
+    case "PASSED":
+      return "default" as const;
+    case "FAILED":
+    case "ERROR":
+      return "destructive" as const;
+    case "BLOCKED":
+    case "RUNNING":
+    case "QUEUED":
+    case "CANCELLED":
+      return "secondary" as const;
+    default:
+      return "outline" as const;
+  }
 };
 
 const getModuleName = (testcase: TestCase) => {
@@ -110,7 +123,7 @@ const getModuleWiseTcId = (allProjectCases: TestCase[], testcase: TestCase) => {
   const currentPrefix = getModulePrefix(getModuleName(testcase));
 
   const sameModuleCases = sortedCases.filter(
-    (tc) => getModulePrefix(getModuleName(tc)) === currentPrefix
+    (tc) => getModulePrefix(getModuleName(tc)) === currentPrefix,
   );
 
   const index = sameModuleCases.findIndex((tc) => tc.id === testcase.id);
@@ -211,10 +224,66 @@ function ExecutionPage() {
     severity: "High",
     status: "Open",
   });
+  const [liveExec, setLiveExec] = useState<{ testcase: TestCase; executionId: number } | null>(
+    null,
+  );
+  const [starting, setStarting] = useState<number | null>(null);
+  const [scriptView, setScriptView] = useState<{ testcase: TestCase; code: string } | null>(null);
 
-  const loadCases = async () => {
+  const execState = useExecutionSocket(liveExec?.executionId ?? null);
+
+  useEffect(() => {
+    if (["PASSED", "FAILED", "BLOCKED", "ERROR", "CANCELLED"].includes(execState.status || "")) {
+      loadCases();
+    }
+  }, [execState.status]);
+
+  const startAutomatedRun = async (testcase: TestCase) => {
+    setStarting(testcase.id);
     try {
-      const response = await fetch(`${API_URL}/testcases`);
+      const scriptRes = await fetch(`${API_URL}/testcases/${testcase.id}/script`);
+      const scriptData = await scriptRes.json();
+
+      if (scriptData.error) {
+        toast.message("Generating Playwright script from the live site...");
+        const genRes = await fetch(`${API_URL}/testcases/${testcase.id}/generate-script`, {
+          method: "POST",
+        });
+        const genData = await genRes.json();
+        if (!genRes.ok || genData.error)
+          throw new Error(genData.error || "Script generation failed");
+      }
+
+      const runRes = await fetch(`${API_URL}/testcases/${testcase.id}/run`, { method: "POST" });
+      const runData = await runRes.json();
+      if (!runRes.ok || runData.error) throw new Error(runData.error || "Failed to start run");
+
+      setLiveExec({ testcase, executionId: runData.execution_id });
+    } catch (err: any) {
+      toast.error(err.message || "Failed to start execution");
+    } finally {
+      setStarting(null);
+    }
+  };
+
+  const viewScript = async (testcase: TestCase) => {
+    try {
+      const res = await fetch(`${API_URL}/testcases/${testcase.id}/script`);
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      setScriptView({ testcase, code: data.script_code });
+    } catch (err: any) {
+      toast.error(err.message || "No generated script yet. Run this test case first.");
+    }
+  };
+
+  const loadCases = async (projectIdOverride?: string) => {
+    const scopedProjectId = projectIdOverride ?? selectedProjectId;
+    try {
+      const url = scopedProjectId
+        ? `${API_URL}/testcases?project_id=${scopedProjectId}&limit=500`
+        : `${API_URL}/testcases?limit=500`;
+      const response = await fetch(url);
       const data = await response.json();
 
       setAllCases(Array.isArray(data) ? data : []);
@@ -224,34 +293,31 @@ function ExecutionPage() {
   };
 
   useEffect(() => {
-    setSelectedProjectId(window.localStorage.getItem("selectedProjectId") || "");
-    setSelectedProjectName(
-      window.localStorage.getItem("selectedProjectName") || ""
-    );
+    const projectId = window.localStorage.getItem("selectedProjectId") || "";
+    setSelectedProjectId(projectId);
+    setSelectedProjectName(window.localStorage.getItem("selectedProjectName") || "");
 
-    loadCases();
+    loadCases(projectId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const projectCases = useMemo(
-    () =>
-      allCases.filter(
-        (testcase) => String(testcase.project_id) === String(selectedProjectId)
-      ),
-    [allCases, selectedProjectId]
+    () => allCases.filter((testcase) => String(testcase.project_id) === String(selectedProjectId)),
+    [allCases, selectedProjectId],
   );
 
   const cases = useMemo(
     () =>
       projectCases.filter((testcase) =>
-        ["Approved", "Passed", "Failed", "Blocked"].includes(testcase.status)
+        ["Approved", "Passed", "Failed", "Blocked"].includes(testcase.status),
       ),
-    [projectCases]
+    [projectCases],
   );
 
   const total = cases.length;
 
   const done = cases.filter((testcase) =>
-    ["Passed", "Failed", "Blocked"].includes(testcase.status)
+    ["Passed", "Failed", "Blocked"].includes(testcase.status),
   ).length;
 
   const progress = total === 0 ? 0 : Math.round((done / total) * 100);
@@ -262,13 +328,9 @@ function ExecutionPage() {
     setComment("");
   };
 
-  const updateStatus = async (
-    testcase: TestCase,
-    status: "Passed" | "Failed" | "Blocked"
-  ) => {
+  const updateStatus = async (testcase: TestCase, status: "Passed" | "Failed" | "Blocked") => {
     try {
-      const endpoint =
-        status === "Passed" ? "pass" : status === "Failed" ? "fail" : "block";
+      const endpoint = status === "Passed" ? "pass" : status === "Failed" ? "fail" : "block";
 
       const response = await fetch(`${API_URL}/testcases/${testcase.id}/${endpoint}`, {
         method: "PUT",
@@ -309,9 +371,7 @@ function ExecutionPage() {
     const isMatching = isActualResultMatching(actual, active.expected_result);
 
     if (!isMatching) {
-      toast.error(
-        "Actual result does not match the expected result. Please mark it as Failed."
-      );
+      toast.error("Actual result does not match the expected result. Please mark it as Failed.");
       return;
     }
 
@@ -350,62 +410,58 @@ function ExecutionPage() {
   };
 
   const submitDefect = async () => {
-  if (!defectForm.testcase_id) {
-    toast.error("Test case ID missing");
-    return;
-  }
-
-  if (!defectForm.defect_title.trim()) {
-    toast.error("Please enter defect title");
-    return;
-  }
-
-  try {
-    const response = await fetch(`${API_URL}/defects`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        testcase_id: defectForm.testcase_id,
-        defect_title: defectForm.defect_title,
-        severity: defectForm.severity,
-        status: defectForm.status,
-      }),
-    });
-
-    const data = await response.json();
-
-    if (!response.ok || data.error) {
-      throw new Error(data.error || data.details || "Failed to log defect");
+    if (!defectForm.testcase_id) {
+      toast.error("Test case ID missing");
+      return;
     }
 
-    toast.success("Defect logged successfully");
-    setDefectOpen(false);
-    setActive(null);
-    loadCases();
-  } catch (error: any) {
-    console.error("Defect log error:", error);
-    toast.error(error.message || "Failed to log defect");
-  }
-};
+    if (!defectForm.defect_title.trim()) {
+      toast.error("Please enter defect title");
+      return;
+    }
+
+    try {
+      const response = await fetch(`${API_URL}/defects`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          testcase_id: defectForm.testcase_id,
+          defect_title: defectForm.defect_title,
+          severity: defectForm.severity,
+          status: defectForm.status,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok || data.error) {
+        throw new Error(data.error || data.details || "Failed to log defect");
+      }
+
+      toast.success("Defect logged successfully");
+      setDefectOpen(false);
+      setActive(null);
+      loadCases();
+    } catch (error: any) {
+      console.error("Defect log error:", error);
+      toast.error(error.message || "Failed to log defect");
+    }
+  };
 
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">
-            Test Execution
-          </h1>
+          <h1 className="text-2xl font-semibold tracking-tight">Test Execution</h1>
 
           <p className="text-sm text-muted-foreground">
             Run approved test cases and capture execution results.
           </p>
 
           {selectedProjectName && (
-            <p className="text-sm font-medium text-primary">
-              Project: {selectedProjectName}
-            </p>
+            <p className="text-sm font-medium text-primary">Project: {selectedProjectName}</p>
           )}
         </div>
 
@@ -419,9 +475,7 @@ function ExecutionPage() {
 
           <Progress value={progress} className="mt-2" />
 
-          <div className="mt-1 text-right text-xs text-muted-foreground">
-            {progress}% complete
-          </div>
+          <div className="mt-1 text-right text-xs text-muted-foreground">{progress}% complete</div>
         </Card>
       </div>
 
@@ -441,12 +495,8 @@ function ExecutionPage() {
           <TableBody>
             {cases.length === 0 && (
               <TableRow>
-                <TableCell
-                  colSpan={6}
-                  className="py-12 text-center text-muted-foreground"
-                >
-                  No approved test cases yet. Approve test cases in the AI
-                  Generation page first.
+                <TableCell colSpan={6} className="py-12 text-center text-muted-foreground">
+                  No approved test cases yet. Approve test cases in the AI Generation page first.
                 </TableCell>
               </TableRow>
             )}
@@ -463,37 +513,52 @@ function ExecutionPage() {
                   <Badge variant="secondary">{getModuleName(testcase)}</Badge>
                 </TableCell>
 
-                <TableCell className="max-w-[420px]">
-                  {testcase.title}
-                </TableCell>
+                <TableCell className="max-w-[420px]">{testcase.title}</TableCell>
 
                 <TableCell className="text-center">
-                  <Badge
-                    variant={
-                      testcase.status === "Passed"
-                        ? "default"
-                        : testcase.status === "Failed"
-                        ? "destructive"
-                        : testcase.status === "Blocked"
-                        ? "secondary"
-                        : "outline"
-                    }
-                  >
-                    {testcase.status === "Approved"
-                      ? "Not Executed"
-                      : testcase.status}
-                  </Badge>
+                  {testcase.automatable && testcase.latest_execution_status ? (
+                    <Badge variant={executionBadgeVariant(testcase.latest_execution_status)}>
+                      {testcase.latest_execution_status}
+                    </Badge>
+                  ) : (
+                    <Badge
+                      variant={
+                        testcase.status === "Passed"
+                          ? "default"
+                          : testcase.status === "Failed"
+                            ? "destructive"
+                            : testcase.status === "Blocked"
+                              ? "secondary"
+                              : "outline"
+                      }
+                    >
+                      {testcase.status === "Approved" ? "Not Executed" : testcase.status}
+                    </Badge>
+                  )}
                 </TableCell>
 
-                <TableCell className="text-right">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => openExec(testcase)}
-                  >
-                    <PlayCircle className="h-4 w-4" />
-                    Execute
-                  </Button>
+                <TableCell className="text-right space-x-2">
+                  {testcase.automatable ? (
+                    <>
+                      <Button size="sm" variant="ghost" onClick={() => viewScript(testcase)}>
+                        <Code2 className="h-4 w-4" />
+                        Script
+                      </Button>
+                      <Button
+                        size="sm"
+                        onClick={() => startAutomatedRun(testcase)}
+                        disabled={starting === testcase.id}
+                      >
+                        <PlayCircle className="h-4 w-4" />
+                        {starting === testcase.id ? "Starting..." : "Execute"}
+                      </Button>
+                    </>
+                  ) : (
+                    <Button size="sm" variant="outline" onClick={() => openExec(testcase)}>
+                      <PlayCircle className="h-4 w-4" />
+                      Execute
+                    </Button>
+                  )}
                 </TableCell>
               </TableRow>
             ))}
@@ -505,8 +570,7 @@ function ExecutionPage() {
         <DialogContent className="max-w-2xl">
           <DialogHeader>
             <DialogTitle>
-              Execute Test Case{" "}
-              {active ? getModuleWiseTcId(projectCases, active) : ""}
+              Execute Test Case {active ? getModuleWiseTcId(projectCases, active) : ""}
             </DialogTitle>
 
             <DialogDescription>
@@ -586,9 +650,7 @@ function ExecutionPage() {
               Log defect
             </DialogTitle>
 
-            <DialogDescription>
-              Linked to Test Case ID {defectForm.testcase_id}
-            </DialogDescription>
+            <DialogDescription>Linked to Test Case ID {defectForm.testcase_id}</DialogDescription>
           </DialogHeader>
 
           <div className="grid gap-3">
@@ -597,9 +659,7 @@ function ExecutionPage() {
 
               <Select
                 value={defectForm.severity}
-                onValueChange={(value) =>
-                  setDefectForm({ ...defectForm, severity: value })
-                }
+                onValueChange={(value) => setDefectForm({ ...defectForm, severity: value })}
               >
                 <SelectTrigger>
                   <SelectValue />
@@ -642,6 +702,97 @@ function ExecutionPage() {
             </Button>
 
             <Button onClick={submitDefect}>Log Defect</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!liveExec} onOpenChange={(open) => !open && setLiveExec(null)}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>
+              Live Run {liveExec && getModuleWiseTcId(projectCases, liveExec.testcase)}
+            </DialogTitle>
+            <DialogDescription>{liveExec?.testcase.title}</DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <div className="flex items-center gap-2 text-sm">
+              <span className="text-muted-foreground">Status:</span>
+              <Badge variant={executionBadgeVariant(execState.status)}>
+                {execState.status || "Connecting..."}
+              </Badge>
+              {!execState.connected && (
+                <span className="text-xs text-muted-foreground">(reconnecting...)</span>
+              )}
+            </div>
+
+            <div className="max-h-72 space-y-2 overflow-auto rounded-md border border-border p-3">
+              {execState.steps.length === 0 && (
+                <div className="text-xs text-muted-foreground">Waiting for the first step...</div>
+              )}
+
+              {[...execState.steps]
+                .sort((a, b) => a.step_number - b.step_number)
+                .map((step) => (
+                  <div key={step.step_number} className="flex items-start gap-2 text-sm">
+                    {step.status === "PASSED" ? (
+                      <CircleCheck className="mt-0.5 h-4 w-4 text-success" />
+                    ) : (
+                      <CircleX className="mt-0.5 h-4 w-4 text-destructive" />
+                    )}
+                    <div>
+                      <div className="font-medium">
+                        Step {step.step_number}
+                        {step.action ? `: ${step.action}` : ""}
+                      </div>
+                      {step.actual_result && (
+                        <div className="text-xs text-muted-foreground">{step.actual_result}</div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+            </div>
+
+            {execState.failureSummary && (
+              <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm">
+                <span className="font-medium">Failure analysis: </span>
+                {execState.failureSummary}
+              </div>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setLiveExec(null)}>
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!scriptView} onOpenChange={(open) => !open && setScriptView(null)}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>
+              Generated Script {scriptView && getModuleWiseTcId(projectCases, scriptView.testcase)}
+            </DialogTitle>
+            <DialogDescription>{scriptView?.testcase.title}</DialogDescription>
+          </DialogHeader>
+
+          <pre className="max-h-96 overflow-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-xs whitespace-pre-wrap">
+            {scriptView?.code}
+          </pre>
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => {
+                navigator.clipboard.writeText(scriptView?.code || "");
+                toast.success("Script copied to clipboard");
+              }}
+            >
+              Copy
+            </Button>
+            <Button onClick={() => setScriptView(null)}>Close</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

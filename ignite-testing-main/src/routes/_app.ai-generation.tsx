@@ -130,6 +130,10 @@ function AIGenerationPage() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
 
+  // Just fetches and displays this project's existing test cases - no
+  // generation-result toasts belong here (that's generate()'s job), and it
+  // must never call itself: it previously did unconditionally, which caused
+  // an unbounded recursive loop of /summary requests every time this ran.
   const loadExistingTestCases = async (projectId: string) => {
     if (!projectId) return;
 
@@ -138,22 +142,8 @@ function AIGenerationPage() {
       const data = await response.json();
 
       if (!response.ok || data.error) {
-  throw new Error(data.details || data.error || "AI generation failed");
-}
-
-if (data.generated_testcases && data.generated_testcases.length > 0) {
-  toast.success(`${data.generated_testcases.length} new unique test cases generated.`);
-} else {
-  toast.warning("No new unique test cases found. Existing duplicates were skipped.");
-}
-
-if (data.skipped_duplicates && data.skipped_duplicates > 0) {
-  toast.info(`${data.skipped_duplicates} duplicate test cases skipped.`);
-}
-
-if (selectedProjectId) {
-  await loadExistingTestCases(selectedProjectId);
-}
+        throw new Error(data.error || "Failed to load existing test cases");
+      }
 
       setGenerated(Array.isArray(data.testcases) ? data.testcases : []);
     } catch {
@@ -321,13 +311,25 @@ if (selectedProjectId) {
         throw new Error(data.details || data.error || "AI generation failed");
       }
 
-      if (data.generated_testcases && data.generated_testcases.length > 0) {
-        setGenerated(data.generated_testcases);
-      } else if (selectedProjectId) {
-        await loadExistingTestCases(selectedProjectId);
+      const createdCount = data.created_count ?? 0;
+
+      if (createdCount > 0) {
+        toast.success(`${createdCount} new unique test cases generated.`);
+      } else {
+        toast.warning("No new unique test cases found. Existing duplicates were skipped.");
       }
 
-      toast.success("Test cases generated successfully");
+      if (data.skipped_duplicates > 0) {
+        toast.info(`${data.skipped_duplicates} duplicate test cases skipped.`);
+      }
+
+      if (data.skipped_invalid > 0) {
+        toast.warning(`${data.skipped_invalid} AI-generated cases failed schema validation and were skipped.`);
+      }
+
+      if (selectedProjectId) {
+        await loadExistingTestCases(selectedProjectId);
+      }
     } catch (error: any) {
       console.error("Generation error:", error);
       toast.error(error.message || "Failed to generate test cases");

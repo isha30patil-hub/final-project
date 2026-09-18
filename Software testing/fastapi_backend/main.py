@@ -1,44 +1,43 @@
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile, Form, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, field_validator
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from PyPDF2 import PdfReader
 import io
 import json
-import re
-import google.generativeai as genai
 import os
-import requests
+import re
+import asyncio
+import traceback
+from datetime import datetime, timezone
 from dotenv import load_dotenv
-from openai import OpenAI
-import anthropic
 from typing import Optional
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
+ARTIFACTS_DIR = os.path.join(BASE_DIR, "artifacts")
+os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 
+# Must run before importing crypto/ai_services/browser_exploration - they read
+# their config (API keys, encryption key) from the environment at import time.
 load_dotenv(ENV_PATH, override=True)
 
-AI_PROVIDER = os.getenv("AI_PROVIDER", "gemini").lower().strip()
+from playwright.async_api import async_playwright, expect as playwright_expect, TimeoutError as PlaywrightTimeoutError
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip().strip('"').strip("'")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip().strip('"').strip("'")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip().strip('"').strip("'")
+import crypto
+from schemas import AITestCase
+import ai_services
+from ai_services import generate_ai_response, extract_json_from_ai_response, get_json_case_list
+import browser_exploration
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5").strip()
+DB_HOST = os.getenv("DB_HOST", "localhost").strip()
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
+DB_NAME = os.getenv("DB_NAME", "testai").strip()
+DB_USER = os.getenv("DB_USER", "postgres").strip()
+DB_PASSWORD = os.getenv("DB_PASSWORD", "").strip()
 
-print("ENV PATH:", ENV_PATH)
-print("AI_PROVIDER:", AI_PROVIDER)
-print("GEMINI KEY LOADED:", bool(GEMINI_API_KEY))
-print("GEMINI KEY LENGTH:", len(GEMINI_API_KEY))
-
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 app = FastAPI()
 
 app.add_middleware(
@@ -48,14 +47,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.mount("/artifacts", StaticFiles(directory=ARTIFACTS_DIR), name="artifacts")
+
+# In-process execution queue + WebSocket subscriber registry (no external broker).
+execution_queue: "asyncio.Queue[int]" = asyncio.Queue()
+active_connections: dict[int, set[WebSocket]] = {}
+playwright_context: dict = {}
+
 
 def get_db_connection():
     return psycopg2.connect(
-        host="localhost",
-        database="testai",
-        user="postgres",
-        password="admin123",
-        port=5432,
+        host=DB_HOST,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        port=DB_PORT,
         cursor_factory=RealDictCursor
     )
 
@@ -71,6 +77,87 @@ def ensure_testcase_ai_columns(cur):
         ADD COLUMN IF NOT EXISTS ai_quality_score INTEGER,
         ADD COLUMN IF NOT EXISTS ai_review_remark TEXT,
         ADD COLUMN IF NOT EXISTS ai_recommendation VARCHAR(20);
+    """)
+
+def ensure_execution_schema(cur):
+    """Additive migration for the execution pipeline. Safe to run multiple times."""
+    cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS base_url TEXT;")
+    cur.execute("""
+        ALTER TABLE testcases
+        ADD COLUMN IF NOT EXISTS latest_execution_status VARCHAR(20),
+        ADD COLUMN IF NOT EXISTS latest_execution_id INTEGER,
+        ADD COLUMN IF NOT EXISTS ai_test_case JSONB,
+        ADD COLUMN IF NOT EXISTS role VARCHAR(50),
+        ADD COLUMN IF NOT EXISTS automatable BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS requires_credentials BOOLEAN NOT NULL DEFAULT FALSE;
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS generated_scripts (
+            id SERIAL PRIMARY KEY,
+            testcase_id INTEGER NOT NULL REFERENCES testcases(id) ON DELETE CASCADE,
+            script_code TEXT NOT NULL,
+            target_url TEXT,
+            dom_snapshot_summary TEXT,
+            generation_model VARCHAR(100),
+            status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_generated_scripts_testcase ON generated_scripts(testcase_id);")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS test_executions (
+            id SERIAL PRIMARY KEY,
+            testcase_id INTEGER NOT NULL REFERENCES testcases(id) ON DELETE CASCADE,
+            generated_script_id INTEGER REFERENCES generated_scripts(id),
+            status VARCHAR(20) NOT NULL DEFAULT 'QUEUED',
+            requested_by VARCHAR(100),
+            queued_at TIMESTAMP NOT NULL DEFAULT NOW(),
+            started_at TIMESTAMP,
+            finished_at TIMESTAMP,
+            failure_classification VARCHAR(30),
+            failure_summary TEXT,
+            failure_analysis JSONB,
+            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_test_executions_testcase ON test_executions(testcase_id);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_test_executions_status ON test_executions(status);")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS test_step_results (
+            id SERIAL PRIMARY KEY,
+            execution_id INTEGER NOT NULL REFERENCES test_executions(id) ON DELETE CASCADE,
+            step_number INTEGER NOT NULL,
+            action TEXT,
+            expected_result TEXT,
+            actual_result TEXT,
+            status VARCHAR(20) NOT NULL,
+            started_at TIMESTAMP,
+            finished_at TIMESTAMP,
+            error_message TEXT
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_test_step_results_execution ON test_step_results(execution_id);")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS test_artifacts (
+            id SERIAL PRIMARY KEY,
+            execution_id INTEGER NOT NULL REFERENCES test_executions(id) ON DELETE CASCADE,
+            step_result_id INTEGER REFERENCES test_step_results(id) ON DELETE CASCADE,
+            artifact_type VARCHAR(20) NOT NULL,
+            file_path TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_test_artifacts_execution ON test_artifacts(execution_id);")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS test_credentials (
+            id SERIAL PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            role VARCHAR(50) NOT NULL,
+            username_encrypted TEXT NOT NULL,
+            password_encrypted TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+            UNIQUE (project_id, role)
+        );
     """)
 
 def normalize_for_duplicate(value):
@@ -128,6 +215,20 @@ def get_json_case_list(parsed):
 
     return []
 
+# Columns returned by list-style testcase queries. Deliberately excludes
+# ai_test_case (JSONB, can be several KB per row) - that column is only
+# needed for single-row lookups (script generation, execution), never for
+# listing, and including it made /testcases and /projects/{id}/summary
+# balloon once projects had 50-100+ generated cases.
+TESTCASE_LIST_COLUMNS = """
+    id, project_id, module, title, steps, expected_result, status,
+    coverage_type, ai_quality_score, ai_review_remark, ai_recommendation,
+    approved_at, solved_at, created_at, latest_execution_status,
+    latest_execution_id, role, automatable, requires_credentials
+"""
+
+DEFAULT_TESTCASE_LIST_LIMIT = 100
+
 class Project(BaseModel):
     name: str
     description: str
@@ -162,6 +263,22 @@ class TestRun(BaseModel):
 class GenerateTestCasesRequest(BaseModel):
     document_id: int
 
+class BaseUrlUpdate(BaseModel):
+    base_url: str
+
+    @field_validator("base_url")
+    @classmethod
+    def normalize_base_url(cls, value: str) -> str:
+        value = value.strip()
+        if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", value):
+            value = f"https://{value}"
+        return value
+
+class CredentialIn(BaseModel):
+    role: str
+    username: str
+    password: str
+
 @app.get("/")
 def home():
     return {"message": "AI Testing Platform FastAPI Backend Running"}
@@ -187,7 +304,11 @@ def get_projects():
     return projects
 
 @app.get("/projects/{project_id}/summary")
-def get_project_summary(project_id: int):
+def get_project_summary(
+    project_id: int,
+    testcases_limit: int = DEFAULT_TESTCASE_LIST_LIMIT,
+    testcases_offset: int = 0,
+):
     conn = get_db_connection()
     cur = conn.cursor()
 
@@ -222,12 +343,13 @@ def get_project_summary(project_id: int):
     """, (project_id,))
     defect_status = cur.fetchall()
 
-    cur.execute("""
-        SELECT *
+    cur.execute(f"""
+        SELECT {TESTCASE_LIST_COLUMNS}
         FROM testcases
         WHERE project_id = %s
-        ORDER BY id ASC;
-    """, (project_id,))
+        ORDER BY id ASC
+        LIMIT %s OFFSET %s;
+    """, (project_id, testcases_limit, testcases_offset))
     testcases = cur.fetchall()
 
     cur.execute("""
@@ -249,6 +371,9 @@ def get_project_summary(project_id: int):
         "total_defects": total_defects,
         "defect_status": defect_status,
         "testcases": testcases,
+        "testcases_returned": len(testcases),
+        "testcases_limit": testcases_limit,
+        "testcases_offset": testcases_offset,
         "defects": defects
     }
 
@@ -267,15 +392,26 @@ def create_project(project: Project):
     return new_project
 
 @app.get("/testcases")
-def get_testcases():
+def get_testcases(
+    project_id: Optional[int] = None,
+    limit: int = DEFAULT_TESTCASE_LIST_LIMIT,
+    offset: int = 0,
+):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("""
-        SELECT *
+    query = f"""
+        SELECT {TESTCASE_LIST_COLUMNS}
         FROM testcases
         WHERE status IN ('Generated', 'Approved', 'Review', 'Rejected', 'Draft', 'Passed', 'Failed', 'Blocked')
-        ORDER BY id ASC;
-    """)
+    """
+    params: list = []
+    if project_id is not None:
+        query += " AND project_id = %s"
+        params.append(project_id)
+    query += " ORDER BY id ASC LIMIT %s OFFSET %s;"
+    params.extend([limit, offset])
+
+    cur.execute(query, tuple(params))
     testcases = cur.fetchall()
     cur.close()
     conn.close()
@@ -720,101 +856,11 @@ async def upload_document(project_id: int = Form(...), file: UploadFile = File(.
         "document": new_document
     }
 
-def extract_json_from_ai_response(text):
+def render_steps_text(case: AITestCase) -> str:
+    if not case.steps:
+        return case.steps_text or ""
+    return "\n".join(f"{s.step}. {s.action} -> Expected: {s.expected_result}" for s in case.steps)
 
-    cleaned = text.strip()
-    cleaned = re.sub(r"```json", "", cleaned)
-    cleaned = re.sub(r"```", "", cleaned)
-    return json.loads(cleaned)
-def generate_ai_response(prompt: str):
-    print("USING AI_PROVIDER:", AI_PROVIDER)
-    print("INSIDE FUNCTION GEMINI KEY LOADED:", bool(GEMINI_API_KEY))
-    print("INSIDE FUNCTION GEMINI KEY LENGTH:", len(GEMINI_API_KEY))
-
-    if AI_PROVIDER == "gemini":
-        if not GEMINI_API_KEY:
-            raise Exception("Gemini API key is missing")
-
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-
-        headers = {
-            "Content-Type": "application/json",
-            "x-goog-api-key": GEMINI_API_KEY,
-        }
-
-        payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {"text": prompt}
-                    ]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.2
-            }
-        }
-
-        response = requests.post(url, headers=headers, json=payload, timeout=120)
-
-        if response.status_code != 200:
-            raise Exception(response.text)
-
-        data = response.json()
-
-        try:
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception:
-            raise Exception(f"Gemini response text not found: {data}")
-
-    if AI_PROVIDER == "openai":
-        if not openai_client:
-            raise Exception("OpenAI API key is missing")
-
-        response = openai_client.responses.create(
-            model=OPENAI_MODEL,
-            input=prompt,
-        )
-
-        return response.output_text
-
-    if AI_PROVIDER == "claude":
-        if not anthropic_client:
-            raise Exception("Claude API key is missing")
-
-        response = anthropic_client.messages.create(
-            model=ANTHROPIC_MODEL,
-            max_tokens=3000,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
-        )
-
-        return response.content[0].text
-
-    raise Exception("Invalid AI provider selected")
-
-def build_testcase_generation_prompt(requirement_text: str):
-    return f"""
-You are a senior QA engineer. Read the requirement/SRS text below and generate a JSON array of test cases.
-
-Requirement text:
-\"\"\"{requirement_text[:12000]}\"\"\"
-
-Return ONLY a JSON array (no markdown, no commentary). Each item must have exactly these fields:
-- "module": short functional area name (string)
-- "title": short test case title (string)
-- "steps": numbered steps to execute the test (string)
-- "expected_result": expected outcome (string)
-- "coverage_type": one of "Positive", "Negative", "Boundary", "Edge Case"
-- "requirement_match": true if the test case is clearly derived from the requirement text, false otherwise
-- "ai_quality_score": integer 0-100 rating how well-formed and relevant the test case is
-
-Generate between 5 and 15 test cases covering positive, negative, and boundary scenarios.
-"""
 
 @app.post("/generate-testcases")
 def generate_testcases(request: GenerateTestCasesRequest):
@@ -835,23 +881,24 @@ def generate_testcases(request: GenerateTestCasesRequest):
         conn.close()
         return {"error": "Document has no extracted text to generate test cases from"}
 
-    prompt = build_testcase_generation_prompt(requirement_text)
-
     try:
-        raw_response = generate_ai_response(prompt)
-        parsed = extract_json_from_ai_response(raw_response)
+        result = ai_services.generate_testcases_from_requirement(requirement_text)
     except Exception as error:
         cur.close()
         conn.close()
         return {"error": f"AI generation failed: {error}"}
 
-    cases = get_json_case_list(parsed)
+    cases: list[AITestCase] = result["cases"]
     if not cases:
         cur.close()
         conn.close()
-        return {"error": "AI response did not contain any test cases", "raw_response": raw_response}
+        return {
+            "error": "AI response did not contain any valid test cases",
+            "validation_errors": result["validation_errors"],
+        }
 
     ensure_testcase_ai_columns(cur)
+    ensure_execution_schema(cur)
 
     cur.execute(
         "SELECT title FROM testcases WHERE project_id = %s;",
@@ -863,7 +910,7 @@ def generate_testcases(request: GenerateTestCasesRequest):
     skipped_duplicates = 0
 
     for case in cases:
-        title = str(case.get("title", "")).strip()
+        title = case.title.strip()
         if not title:
             continue
 
@@ -873,8 +920,8 @@ def generate_testcases(request: GenerateTestCasesRequest):
             continue
         existing_titles.add(normalized_title)
 
-        requirement_match = to_boolean(case.get("requirement_match", True))
-        ai_quality_score = safe_int(case.get("ai_quality_score"))
+        requirement_match = to_boolean(case.requirement_match if case.requirement_match is not None else True)
+        ai_quality_score = safe_int(case.ai_quality_score)
         status = decide_auto_status(requirement_match, ai_quality_score)
         ai_recommendation = build_ai_recommendation(status)
 
@@ -891,22 +938,30 @@ def generate_testcases(request: GenerateTestCasesRequest):
                 coverage_type,
                 ai_quality_score,
                 ai_review_remark,
-                ai_recommendation
+                ai_recommendation,
+                ai_test_case,
+                role,
+                automatable,
+                requires_credentials
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *;
             """,
             (
                 document["project_id"],
-                str(case.get("module", "General")).strip() or "General",
+                case.module or "General",
                 title,
-                str(case.get("steps", "")).strip(),
-                str(case.get("expected_result", "")).strip(),
+                render_steps_text(case),
+                case.expected_final_state or case.expected_result or "",
                 status,
-                case.get("coverage_type"),
+                case.coverage_type or case.type,
                 ai_quality_score,
                 f"Requirement match: {requirement_match}",
                 ai_recommendation,
+                case.model_dump_json(),
+                case.role,
+                case.automation.automatable,
+                case.automation.requires_credentials,
             )
         )
         created_testcases.append(cur.fetchone())
@@ -919,5 +974,567 @@ def generate_testcases(request: GenerateTestCasesRequest):
         "message": "AI test cases generated successfully",
         "created_count": len(created_testcases),
         "skipped_duplicates": skipped_duplicates,
+        "skipped_invalid": len(result["validation_errors"]),
+        "coverage_report": result["coverage_report"],
         "testcases": created_testcases,
     }
+
+
+# ---------------------------------------------------------------------------
+# Execution pipeline: environment settings, credentials, script generation
+# ---------------------------------------------------------------------------
+
+@app.put("/projects/{project_id}/base-url")
+def update_base_url(project_id: int, update: BaseUrlUpdate):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    ensure_execution_schema(cur)
+    cur.execute("UPDATE projects SET base_url = %s WHERE id = %s RETURNING *;", (update.base_url, project_id))
+    updated = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    if not updated:
+        return {"error": "Project not found"}
+    return updated
+
+
+@app.get("/projects/{project_id}/credentials")
+def list_credentials(project_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT role, created_at FROM test_credentials WHERE project_id = %s ORDER BY role;", (project_id,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [{"role": r["role"], "has_credentials": True, "created_at": r["created_at"]} for r in rows]
+
+
+@app.post("/projects/{project_id}/credentials")
+def set_credentials(project_id: int, credential: CredentialIn):
+    if not crypto.credentials_configured():
+        return {"error": "CREDENTIAL_ENCRYPTION_KEY is not configured on the server"}
+
+    username_encrypted = crypto.encrypt_value(credential.username)
+    password_encrypted = crypto.encrypt_value(credential.password)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO test_credentials (project_id, role, username_encrypted, password_encrypted)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (project_id, role) DO UPDATE
+        SET username_encrypted = EXCLUDED.username_encrypted, password_encrypted = EXCLUDED.password_encrypted
+        RETURNING role, created_at;
+    """, (project_id, credential.role, username_encrypted, password_encrypted))
+    saved = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"role": saved["role"], "has_credentials": True}
+
+
+@app.delete("/projects/{project_id}/credentials/{role}")
+def delete_credentials(project_id: int, role: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM test_credentials WHERE project_id = %s AND role = %s RETURNING role;", (project_id, role))
+    deleted = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    if not deleted:
+        return {"error": "No credentials found for that role"}
+    return {"message": "Credentials removed", "role": role}
+
+
+def _parse_ai_test_case(raw) -> AITestCase:
+    if isinstance(raw, str):
+        raw = json.loads(raw)
+    return AITestCase.model_validate(raw)
+
+
+@app.post("/testcases/{testcase_id}/generate-script")
+async def generate_script(testcase_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT t.*, p.base_url FROM testcases t JOIN projects p ON p.id = t.project_id WHERE t.id = %s;",
+        (testcase_id,)
+    )
+    testcase = cur.fetchone()
+    if not testcase:
+        cur.close()
+        conn.close()
+        return {"error": "Test case not found"}
+    if not testcase.get("base_url"):
+        cur.close()
+        conn.close()
+        return {"error": "Project has no base_url configured. Set it in Test Environment settings first."}
+    if not testcase.get("ai_test_case"):
+        cur.close()
+        conn.close()
+        return {"error": "This test case was not generated with the structured AI schema; cannot auto-generate a script"}
+
+    ai_case = _parse_ai_test_case(testcase["ai_test_case"])
+
+    browser = playwright_context.get("browser")
+    if not browser:
+        cur.close()
+        conn.close()
+        return {"error": "Browser not ready yet, try again shortly"}
+
+    try:
+        dom_summary = await browser_exploration.explore_page(testcase["base_url"], browser)
+    except Exception as exc:
+        cur.close()
+        conn.close()
+        return {"error": f"Could not explore target site: {exc}"}
+
+    try:
+        script_code = ai_services.generate_playwright_script(ai_case, dom_summary, testcase["base_url"])
+    except Exception as exc:
+        cur.close()
+        conn.close()
+        return {"error": f"Script generation failed: {exc}"}
+
+    cur.execute("UPDATE generated_scripts SET status = 'STALE' WHERE testcase_id = %s AND status = 'ACTIVE';", (testcase_id,))
+    cur.execute("""
+        INSERT INTO generated_scripts (testcase_id, script_code, target_url, dom_snapshot_summary, generation_model, status)
+        VALUES (%s, %s, %s, %s, %s, 'ACTIVE')
+        RETURNING *;
+    """, (testcase_id, script_code, testcase["base_url"], dom_summary, ai_services.AI_PROVIDER))
+    new_script = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"message": "Script generated", "script": new_script}
+
+
+@app.get("/testcases/{testcase_id}/script")
+def get_script(testcase_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM generated_scripts WHERE testcase_id = %s AND status = 'ACTIVE'
+        ORDER BY id DESC LIMIT 1;
+    """, (testcase_id,))
+    script = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not script:
+        return {"error": "No active generated script for this test case"}
+    return script
+
+
+# ---------------------------------------------------------------------------
+# Execution pipeline: run / cancel / results
+# ---------------------------------------------------------------------------
+
+@app.post("/testcases/{testcase_id}/run")
+async def run_testcase_endpoint(testcase_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id FROM generated_scripts WHERE testcase_id = %s AND status = 'ACTIVE'
+        ORDER BY id DESC LIMIT 1;
+    """, (testcase_id,))
+    script = cur.fetchone()
+    if not script:
+        cur.close()
+        conn.close()
+        return {"error": "No active generated script for this test case. Generate one first."}
+
+    cur.execute("""
+        INSERT INTO test_executions (testcase_id, generated_script_id, status)
+        VALUES (%s, %s, 'QUEUED')
+        RETURNING id;
+    """, (testcase_id, script["id"]))
+    execution_id = cur.fetchone()["id"]
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    await execution_queue.put(execution_id)
+    return {"execution_id": execution_id, "status": "QUEUED"}
+
+
+@app.post("/test-executions/{execution_id}/cancel")
+def cancel_execution(execution_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE test_executions SET status = 'CANCELLED', finished_at = NOW()
+        WHERE id = %s AND status = 'QUEUED'
+        RETURNING *;
+    """, (execution_id,))
+    updated = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    if not updated:
+        return {"error": "Execution not found, already running, or already finished"}
+    return updated
+
+
+@app.get("/test-executions/{execution_id}")
+def get_execution(execution_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM test_executions WHERE id = %s;", (execution_id,))
+    execution = cur.fetchone()
+    if not execution:
+        cur.close()
+        conn.close()
+        return {"error": "Execution not found"}
+    cur.execute("SELECT * FROM test_step_results WHERE execution_id = %s ORDER BY step_number;", (execution_id,))
+    steps = cur.fetchall()
+    cur.execute("SELECT * FROM test_artifacts WHERE execution_id = %s ORDER BY id;", (execution_id,))
+    artifacts = cur.fetchall()
+    cur.close()
+    conn.close()
+    return {"execution": execution, "steps": steps, "artifacts": artifacts}
+
+
+@app.get("/test-executions")
+def list_executions(project_id: Optional[int] = None, testcase_id: Optional[int] = None, status: Optional[str] = None):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    query = """
+        SELECT te.*, t.title AS testcase_title, t.project_id
+        FROM test_executions te
+        JOIN testcases t ON t.id = te.testcase_id
+        WHERE 1=1
+    """
+    params = []
+    if project_id is not None:
+        query += " AND t.project_id = %s"
+        params.append(project_id)
+    if testcase_id is not None:
+        query += " AND te.testcase_id = %s"
+        params.append(testcase_id)
+    if status is not None:
+        query += " AND te.status = %s"
+        params.append(status)
+    query += " ORDER BY te.id DESC;"
+    cur.execute(query, tuple(params))
+    executions = cur.fetchall()
+    cur.close()
+    conn.close()
+    return executions
+
+
+# ---------------------------------------------------------------------------
+# Live execution WebSocket
+# ---------------------------------------------------------------------------
+
+def _now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _jsonable_row(row):
+    if row is None:
+        return None
+    result = {}
+    for key, value in dict(row).items():
+        result[key] = value.isoformat() if isinstance(value, datetime) else value
+    return result
+
+
+async def publish_execution_event(execution_id: int, event: dict):
+    for ws in list(active_connections.get(execution_id, [])):
+        try:
+            await ws.send_json(event)
+        except Exception:
+            active_connections.get(execution_id, set()).discard(ws)
+
+
+@app.websocket("/ws/executions/{execution_id}")
+async def ws_execution(websocket: WebSocket, execution_id: int):
+    await websocket.accept()
+    active_connections.setdefault(execution_id, set()).add(websocket)
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM test_executions WHERE id = %s;", (execution_id,))
+        execution = cur.fetchone()
+        cur.execute("SELECT * FROM test_step_results WHERE execution_id = %s ORDER BY step_number;", (execution_id,))
+        steps = cur.fetchall()
+        cur.close()
+        conn.close()
+        await websocket.send_json({
+            "type": "SNAPSHOT",
+            "execution": _jsonable_row(execution),
+            "steps": [_jsonable_row(s) for s in steps],
+        })
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        active_connections.get(execution_id, set()).discard(websocket)
+
+
+# ---------------------------------------------------------------------------
+# Execution worker (in-process asyncio queue, single browser instance)
+# ---------------------------------------------------------------------------
+
+def resolve_credentials(cur, project_id: int):
+    """Returns (data, secret_values): data maps credential placeholder tokens
+    to decrypted values; secret_values is the flat list used for masking
+    persisted text. Both {{ROLE_USERNAME}} and {ROLE_USERNAME}} spellings are
+    included since generated scripts don't always use the exact double-brace
+    form requested in the codegen prompt."""
+    data = {}
+    secret_values = []
+    cur.execute(
+        "SELECT role, username_encrypted, password_encrypted FROM test_credentials WHERE project_id = %s;",
+        (project_id,)
+    )
+    for row in cur.fetchall():
+        role_key = row["role"].strip().upper().replace(" ", "_")
+        try:
+            username = crypto.decrypt_value(row["username_encrypted"])
+            password = crypto.decrypt_value(row["password_encrypted"])
+        except Exception:
+            continue
+        for field, value in (("USERNAME", username), ("PASSWORD", password)):
+            data[f"{{{{{role_key}_{field}}}}}"] = value  # {{ROLE_FIELD}}
+            data[f"{{{role_key}_{field}}}"] = value        # {ROLE_FIELD}
+        secret_values.extend([username, password])
+    return data, secret_values
+
+
+async def run_execution(execution_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT status FROM test_executions WHERE id = %s;", (execution_id,))
+    current = cur.fetchone()
+    if not current or current["status"] == "CANCELLED":
+        cur.close()
+        conn.close()
+        return
+
+    cur.execute("""
+        SELECT te.*, gs.script_code, gs.target_url, gs.dom_snapshot_summary,
+               t.title AS testcase_title, t.ai_test_case AS testcase_ai_case, t.project_id AS project_id
+        FROM test_executions te
+        JOIN testcases t ON t.id = te.testcase_id
+        LEFT JOIN generated_scripts gs ON gs.id = te.generated_script_id
+        WHERE te.id = %s;
+    """, (execution_id,))
+    execution = cur.fetchone()
+
+    if not execution or not execution["script_code"]:
+        cur.execute("""
+            UPDATE test_executions SET status = 'ERROR', failure_summary = %s, finished_at = NOW()
+            WHERE id = %s;
+        """, ("No generated script found; generate one first", execution_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+        await publish_execution_event(execution_id, {
+            "type": "TEST_ERROR", "execution_id": execution_id,
+            "failure_summary": "No generated script found", "ts": _now(),
+        })
+        return
+
+    steps_by_number = {}
+    if execution["testcase_ai_case"]:
+        try:
+            ai_case = _parse_ai_test_case(execution["testcase_ai_case"])
+            steps_by_number = {s.step: s for s in ai_case.steps}
+        except Exception:
+            steps_by_number = {}
+
+    cur.execute("UPDATE test_executions SET status = 'RUNNING', started_at = NOW() WHERE id = %s;", (execution_id,))
+    conn.commit()
+    await publish_execution_event(execution_id, {
+        "type": "TEST_STARTED", "execution_id": execution_id,
+        "testcase_id": execution["testcase_id"], "ts": _now(),
+    })
+
+    resolved_data, secret_values = resolve_credentials(cur, execution["project_id"])
+
+    steps_log = []
+    status = "PASSED"
+    failure_classification = None
+    failure_summary = None
+    any_step_reported = False
+
+    browser = playwright_context["browser"]
+    context = await browser.new_context()
+    page = await context.new_page()
+    artifact_dir = os.path.join(ARTIFACTS_DIR, str(execution_id))
+    os.makedirs(artifact_dir, exist_ok=True)
+    trace_path = os.path.join(artifact_dir, "trace.zip")
+    await context.tracing.start(screenshots=True, snapshots=True)
+
+    async def report_step(step_number, step_status, actual_result):
+        nonlocal any_step_reported, status
+        any_step_reported = True
+        step_status = "PASSED" if str(step_status).upper() == "PASSED" else "FAILED"
+        masked_actual = crypto.mask_secrets(str(actual_result), secret_values)
+        planned = steps_by_number.get(step_number)
+
+        cur.execute("""
+            INSERT INTO test_step_results
+                (execution_id, step_number, action, expected_result, actual_result, status, started_at, finished_at)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+            RETURNING id;
+        """, (
+            execution_id, step_number,
+            planned.action if planned else None,
+            planned.expected_result if planned else None,
+            masked_actual, step_status,
+        ))
+        step_row = cur.fetchone()
+        conn.commit()
+        steps_log.append({"step": step_number, "status": step_status, "actual_result": masked_actual})
+
+        if step_status == "FAILED":
+            status = "FAILED"
+            screenshot_rel = f"{execution_id}/step_{step_number}_failure.png"
+            try:
+                await page.screenshot(path=os.path.join(ARTIFACTS_DIR, screenshot_rel))
+                cur.execute("""
+                    INSERT INTO test_artifacts (execution_id, step_result_id, artifact_type, file_path)
+                    VALUES (%s, %s, 'SCREENSHOT', %s);
+                """, (execution_id, step_row["id"], f"/artifacts/{screenshot_rel}"))
+                conn.commit()
+            except Exception:
+                pass
+
+        await publish_execution_event(execution_id, {
+            "type": "STEP_PASSED" if step_status == "PASSED" else "STEP_FAILED",
+            "execution_id": execution_id, "step_number": step_number,
+            "actual_result": masked_actual, "ts": _now(),
+        })
+
+    try:
+        # Pre-populate the exec namespace with the names generated scripts are
+        # told to use for assertions (expect(...)), so a script works even if
+        # the model didn't write its own import line.
+        namespace: dict = {"expect": playwright_expect, "asyncio": asyncio}
+        exec(compile(execution["script_code"], f"<generated_script_{execution['testcase_id']}>", "exec"), namespace)
+        run_fn = namespace.get("run")
+        if not callable(run_fn):
+            raise RuntimeError("Generated script does not define an async run(page, data, report_step) function")
+        await asyncio.wait_for(run_fn(page, resolved_data, report_step), timeout=120)
+    except asyncio.TimeoutError:
+        status = "ERROR"
+        failure_classification = "ENVIRONMENT_ERROR" if not any_step_reported else "ERROR"
+        failure_summary = "Script execution timed out"
+    except PlaywrightTimeoutError as exc:
+        status = "ERROR"
+        failure_classification = "ENVIRONMENT_ERROR" if not any_step_reported else "ERROR"
+        failure_summary = crypto.mask_secrets(f"Timeout: {exc}", secret_values)
+    except Exception as exc:
+        status = "BLOCKED" if not any_step_reported else "ERROR"
+        failure_classification = "ENVIRONMENT_ERROR" if status == "BLOCKED" else None
+        failure_summary = crypto.mask_secrets(f"{type(exc).__name__}: {exc}", secret_values)
+    finally:
+        try:
+            await context.tracing.stop(path=trace_path)
+            cur.execute("""
+                INSERT INTO test_artifacts (execution_id, artifact_type, file_path)
+                VALUES (%s, 'TRACE', %s);
+            """, (execution_id, f"/artifacts/{execution_id}/trace.zip"))
+            conn.commit()
+        except Exception:
+            pass
+        await context.close()
+
+    failure_analysis_data = None
+    if status in ("FAILED", "ERROR"):
+        analysis = ai_services.analyze_failure(
+            execution["testcase_title"], steps_log, execution["dom_snapshot_summary"] or ""
+        )
+        if analysis:
+            failure_analysis_data = analysis.model_dump()
+            failure_summary = failure_summary or analysis.likely_cause
+
+    cur.execute("""
+        UPDATE test_executions
+        SET status = %s, finished_at = NOW(), failure_classification = %s,
+            failure_summary = %s, failure_analysis = %s
+        WHERE id = %s;
+    """, (
+        status, failure_classification, failure_summary,
+        json.dumps(failure_analysis_data) if failure_analysis_data else None,
+        execution_id,
+    ))
+    cur.execute(
+        "UPDATE testcases SET latest_execution_status = %s, latest_execution_id = %s WHERE id = %s;",
+        (status, execution_id, execution["testcase_id"])
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    await publish_execution_event(execution_id, {
+        "type": f"TEST_{status}", "execution_id": execution_id,
+        "failure_summary": failure_summary, "ts": _now(),
+    })
+
+
+async def execution_worker_loop():
+    while True:
+        execution_id = await execution_queue.get()
+        try:
+            await run_execution(execution_id)
+        except Exception:
+            traceback.print_exc()
+            try:
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("""
+                    UPDATE test_executions SET status = 'ERROR', failure_summary = 'Worker crashed', finished_at = NOW()
+                    WHERE id = %s;
+                """, (execution_id,))
+                conn.commit()
+                cur.close()
+                conn.close()
+            except Exception:
+                pass
+        finally:
+            execution_queue.task_done()
+
+
+@app.on_event("startup")
+async def on_startup():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    ensure_testcase_ai_columns(cur)
+    ensure_execution_schema(cur)
+    conn.commit()
+
+    cur.execute("""
+        UPDATE test_executions SET status = 'ERROR', failure_summary = 'Server restarted mid-run', finished_at = NOW()
+        WHERE status = 'RUNNING';
+    """)
+    conn.commit()
+    cur.execute("SELECT id FROM test_executions WHERE status = 'QUEUED' ORDER BY id;")
+    queued_ids = [row["id"] for row in cur.fetchall()]
+    cur.close()
+    conn.close()
+
+    pw = await async_playwright().start()
+    playwright_context["pw"] = pw
+    playwright_context["browser"] = await pw.chromium.launch(headless=True)
+
+    for execution_id in queued_ids:
+        await execution_queue.put(execution_id)
+
+    asyncio.create_task(execution_worker_loop())
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    browser = playwright_context.get("browser")
+    if browser:
+        await browser.close()
+    pw = playwright_context.get("pw")
+    if pw:
+        await pw.stop()
