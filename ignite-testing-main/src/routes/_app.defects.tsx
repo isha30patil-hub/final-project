@@ -134,7 +134,7 @@ function DefectsPage() {
 
   const loadTestcases = async () => {
   try {
-    const response = await fetch(`${API_URL}/testcases`);
+    const response = await fetch(`${API_URL}/testcases?limit=5000`);
     const data = await response.json();
 
     setTestcases(Array.isArray(data) ? data : []);

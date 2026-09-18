@@ -20,7 +20,7 @@ import { Route as AppExecutionRouteImport } from './routes/_app.execution'
 import { Route as AppDefectsRouteImport } from './routes/_app.defects'
 import { Route as AppDashboardRouteImport } from './routes/_app.dashboard'
 import { Route as AppAiGenerationRouteImport } from './routes/_app.ai-generation'
-import { Route as AppProjectsProjectIdRouteImport } from './routes/_app.projects.$projectId'
+import { Route as AppProjectsProjectIdRouteImport } from './routes/_app.projects_.$projectId'
 import { Route as AppAiGenerationBackupRouteImport } from './routes/_app.ai-generation.backup'
 
 const LoginRoute = LoginRouteImport.update({
@@ -78,9 +78,9 @@ const AppAiGenerationRoute = AppAiGenerationRouteImport.update({
   getParentRoute: () => AppRoute,
 } as any)
 const AppProjectsProjectIdRoute = AppProjectsProjectIdRouteImport.update({
-  id: '/$projectId',
-  path: '/$projectId',
-  getParentRoute: () => AppProjectsRoute,
+  id: '/projects_/$projectId',
+  path: '/projects/$projectId',
+  getParentRoute: () => AppRoute,
 } as any)
 const AppAiGenerationBackupRoute = AppAiGenerationBackupRouteImport.update({
   id: '/backup',
@@ -95,7 +95,7 @@ export interface FileRoutesByFullPath {
   '/dashboard': typeof AppDashboardRoute
   '/defects': typeof AppDefectsRoute
   '/execution': typeof AppExecutionRoute
-  '/projects': typeof AppProjectsRouteWithChildren
+  '/projects': typeof AppProjectsRoute
   '/regression': typeof AppRegressionRoute
   '/reports': typeof AppReportsRoute
   '/settings': typeof AppSettingsRoute
@@ -109,7 +109,7 @@ export interface FileRoutesByTo {
   '/dashboard': typeof AppDashboardRoute
   '/defects': typeof AppDefectsRoute
   '/execution': typeof AppExecutionRoute
-  '/projects': typeof AppProjectsRouteWithChildren
+  '/projects': typeof AppProjectsRoute
   '/regression': typeof AppRegressionRoute
   '/reports': typeof AppReportsRoute
   '/settings': typeof AppSettingsRoute
@@ -125,12 +125,12 @@ export interface FileRoutesById {
   '/_app/dashboard': typeof AppDashboardRoute
   '/_app/defects': typeof AppDefectsRoute
   '/_app/execution': typeof AppExecutionRoute
-  '/_app/projects': typeof AppProjectsRouteWithChildren
+  '/_app/projects': typeof AppProjectsRoute
   '/_app/regression': typeof AppRegressionRoute
   '/_app/reports': typeof AppReportsRoute
   '/_app/settings': typeof AppSettingsRoute
   '/_app/ai-generation/backup': typeof AppAiGenerationBackupRoute
-  '/_app/projects/$projectId': typeof AppProjectsProjectIdRoute
+  '/_app/projects_/$projectId': typeof AppProjectsProjectIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -175,7 +175,7 @@ export interface FileRouteTypes {
     | '/_app/reports'
     | '/_app/settings'
     | '/_app/ai-generation/backup'
-    | '/_app/projects/$projectId'
+    | '/_app/projects_/$projectId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -263,12 +263,12 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppAiGenerationRouteImport
       parentRoute: typeof AppRoute
     }
-    '/_app/projects/$projectId': {
-      id: '/_app/projects/$projectId'
-      path: '/$projectId'
+    '/_app/projects_/$projectId': {
+      id: '/_app/projects_/$projectId'
+      path: '/projects/$projectId'
       fullPath: '/projects/$projectId'
       preLoaderRoute: typeof AppProjectsProjectIdRouteImport
-      parentRoute: typeof AppProjectsRoute
+      parentRoute: typeof AppRoute
     }
     '/_app/ai-generation/backup': {
       id: '/_app/ai-generation/backup'
@@ -292,27 +292,16 @@ const AppAiGenerationRouteWithChildren = AppAiGenerationRoute._addFileChildren(
   AppAiGenerationRouteChildren,
 )
 
-interface AppProjectsRouteChildren {
-  AppProjectsProjectIdRoute: typeof AppProjectsProjectIdRoute
-}
-
-const AppProjectsRouteChildren: AppProjectsRouteChildren = {
-  AppProjectsProjectIdRoute: AppProjectsProjectIdRoute,
-}
-
-const AppProjectsRouteWithChildren = AppProjectsRoute._addFileChildren(
-  AppProjectsRouteChildren,
-)
-
 interface AppRouteChildren {
   AppAiGenerationRoute: typeof AppAiGenerationRouteWithChildren
   AppDashboardRoute: typeof AppDashboardRoute
   AppDefectsRoute: typeof AppDefectsRoute
   AppExecutionRoute: typeof AppExecutionRoute
-  AppProjectsRoute: typeof AppProjectsRouteWithChildren
+  AppProjectsRoute: typeof AppProjectsRoute
   AppRegressionRoute: typeof AppRegressionRoute
   AppReportsRoute: typeof AppReportsRoute
   AppSettingsRoute: typeof AppSettingsRoute
+  AppProjectsProjectIdRoute: typeof AppProjectsProjectIdRoute
 }
 
 const AppRouteChildren: AppRouteChildren = {
@@ -320,10 +309,11 @@ const AppRouteChildren: AppRouteChildren = {
   AppDashboardRoute: AppDashboardRoute,
   AppDefectsRoute: AppDefectsRoute,
   AppExecutionRoute: AppExecutionRoute,
-  AppProjectsRoute: AppProjectsRouteWithChildren,
+  AppProjectsRoute: AppProjectsRoute,
   AppRegressionRoute: AppRegressionRoute,
   AppReportsRoute: AppReportsRoute,
   AppSettingsRoute: AppSettingsRoute,
+  AppProjectsProjectIdRoute: AppProjectsProjectIdRoute,
 }
 
 const AppRouteWithChildren = AppRoute._addFileChildren(AppRouteChildren)

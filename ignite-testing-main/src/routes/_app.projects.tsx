@@ -158,19 +158,18 @@ function ProjectsPage() {
                 </TableCell>
 
                <TableCell className="text-right">
-  <button
-    type="button"
+  <Link
+    to="/projects/$projectId"
+    params={{ projectId: String(project.id) }}
     className="inline-flex h-9 w-9 items-center justify-center rounded-md hover:bg-muted"
     onClick={() => {
       localStorage.setItem("selectedProjectId", String(project.id));
       localStorage.setItem("selectedProjectName", project.name);
-
-      window.location.href = `/projects/${project.id}`;
     }}
     aria-label="Open project"
   >
     <Eye className="h-4 w-4" />
-  </button>
+  </Link>
 </TableCell>
               </TableRow>
             ))}

@@ -27,12 +27,19 @@ import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { API_URL } from "@/lib/api";
 
 export const Route = createFileRoute("/_app/reports")({
   component: ReportsPage,
 });
-
-const API_URL = "http://localhost:8000";
 
 type TestCase = {
   id: number;
@@ -51,6 +58,35 @@ type Defect = {
   severity: string;
   status: string;
 };
+
+type Execution = {
+  id: number;
+  testcase_id: number;
+  testcase_title: string;
+  status: string;
+  queued_at: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  failure_summary?: string | null;
+};
+
+const executionBadgeVariant = (status: string) => {
+  switch (status) {
+    case "PASSED":
+      return "default" as const;
+    case "FAILED":
+    case "ERROR":
+      return "destructive" as const;
+    default:
+      return "secondary" as const;
+  }
+};
+
+function durationLabel(exec: Execution) {
+  if (!exec.started_at || !exec.finished_at) return "—";
+  const ms = new Date(exec.finished_at).getTime() - new Date(exec.started_at).getTime();
+  return `${(ms / 1000).toFixed(1)}s`;
+}
 
 function getModule(title: string) {
   const lower = title.toLowerCase();
@@ -71,18 +107,23 @@ function getDate(value?: string) {
 function ReportsPage() {
   const [testCases, setTestCases] = useState<TestCase[]>([]);
   const [defects, setDefects] = useState<Defect[]>([]);
-  
+  const [executions, setExecutions] = useState<Execution[]>([]);
 
   const loadReports = async () => {
     try {
-      const tcResponse = await fetch(`${API_URL}/testcases`);
+      // This page aggregates counts across every project, so it needs the
+      // full set rather than the server's default page size.
+      const tcResponse = await fetch(`${API_URL}/testcases?limit=5000`);
       const defectResponse = await fetch(`${API_URL}/defects`);
+      const execResponse = await fetch(`${API_URL}/test-executions`);
 
       const tcData = await tcResponse.json();
       const defectData = await defectResponse.json();
+      const execData = await execResponse.json();
 
       setTestCases(tcData);
       setDefects(defectData);
+      setExecutions(Array.isArray(execData) ? execData : []);
     } catch {
       toast.error("Failed to load reports data");
     }
@@ -285,7 +326,9 @@ function ReportsPage() {
 
         <Card className="p-5">
           <h3 className="text-sm font-semibold">Remaining</h3>
-          <div className="mt-3 text-3xl font-semibold text-warning-foreground">{remainingToday}</div>
+          <div className="mt-3 text-3xl font-semibold text-warning-foreground">
+            {remainingToday}
+          </div>
           <div className="text-xs text-muted-foreground">Pending completion</div>
         </Card>
 
@@ -312,8 +355,18 @@ function ReportsPage() {
               <YAxis stroke="var(--color-muted-foreground)" fontSize={12} />
               <Tooltip />
               <Legend />
-              <Bar dataKey="solved" name="Solved / Approved" fill="var(--color-success)" radius={[6, 6, 0, 0]} />
-              <Bar dataKey="remaining" name="Remaining" fill="var(--color-primary)" radius={[6, 6, 0, 0]} />
+              <Bar
+                dataKey="solved"
+                name="Solved / Approved"
+                fill="var(--color-success)"
+                radius={[6, 6, 0, 0]}
+              />
+              <Bar
+                dataKey="remaining"
+                name="Remaining"
+                fill="var(--color-primary)"
+                radius={[6, 6, 0, 0]}
+              />
             </BarChart>
           </ResponsiveContainer>
         </div>
@@ -366,7 +419,13 @@ function ReportsPage() {
           <div className="mt-2 h-44">
             <ResponsiveContainer>
               <PieChart>
-                <Pie data={execution} dataKey="value" nameKey="name" outerRadius={65} innerRadius={40}>
+                <Pie
+                  data={execution}
+                  dataKey="value"
+                  nameKey="name"
+                  outerRadius={65}
+                  innerRadius={40}
+                >
                   {execution.map((d) => (
                     <Cell key={d.name} fill={d.color} />
                   ))}
@@ -387,7 +446,13 @@ function ReportsPage() {
           <div className="mt-2 h-44">
             <ResponsiveContainer>
               <PieChart>
-                <Pie data={severity} dataKey="value" nameKey="name" outerRadius={65} innerRadius={40}>
+                <Pie
+                  data={severity}
+                  dataKey="value"
+                  nameKey="name"
+                  outerRadius={65}
+                  innerRadius={40}
+                >
                   {severity.map((d) => (
                     <Cell key={d.name} fill={d.color} />
                   ))}
@@ -422,7 +487,11 @@ function ReportsPage() {
               <ShieldCheck className="h-4 w-4 text-success" /> Requirement coverage
             </h3>
             <Badge variant="outline">
-              Avg {coverage.length === 0 ? 0 : Math.round(coverage.reduce((a, b) => a + b.pct, 0) / coverage.length)}%
+              Avg{" "}
+              {coverage.length === 0
+                ? 0
+                : Math.round(coverage.reduce((a, b) => a + b.pct, 0) / coverage.length)}
+              %
             </Badge>
           </div>
 
@@ -465,6 +534,46 @@ function ReportsPage() {
             </li>
           ))}
         </ul>
+      </Card>
+
+      <Card className="overflow-hidden">
+        <div className="flex items-center justify-between p-5 pb-0">
+          <h3 className="text-sm font-semibold">Automated Execution History</h3>
+          <Badge variant="outline">{executions.length} runs</Badge>
+        </div>
+
+        <Table className="mt-3">
+          <TableHeader>
+            <TableRow>
+              <TableHead>Test Case</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead>Duration</TableHead>
+              <TableHead>Failure Summary</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {executions.length === 0 && (
+              <TableRow>
+                <TableCell colSpan={4} className="py-10 text-center text-muted-foreground">
+                  No automated runs yet. Execute an automatable test case from the Execution page.
+                </TableCell>
+              </TableRow>
+            )}
+
+            {executions.map((exec) => (
+              <TableRow key={exec.id}>
+                <TableCell className="max-w-[320px]">{exec.testcase_title}</TableCell>
+                <TableCell>
+                  <Badge variant={executionBadgeVariant(exec.status)}>{exec.status}</Badge>
+                </TableCell>
+                <TableCell>{durationLabel(exec)}</TableCell>
+                <TableCell className="max-w-[360px] text-xs text-muted-foreground">
+                  {exec.failure_summary || "—"}
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
       </Card>
     </div>
   );
