@@ -39,11 +39,15 @@ DB_NAME = os.getenv("DB_NAME", "testai").strip()
 DB_USER = os.getenv("DB_USER", "postgres").strip()
 DB_PASSWORD = os.getenv("DB_PASSWORD", "").strip()
 
+# Comma-separated list of allowed browser origins, e.g. "http://localhost:8080,http://localhost:5173".
+# Defaults to "*" (any origin) when unset.
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()] or ["*"]
+
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1434,3 +1438,16 @@ async def on_shutdown():
     pw = playwright_context.get("pw")
     if pw:
         await pw.stop()
+
+
+if __name__ == "__main__":
+    # `python main.py` — host/port come from .env (APP_HOST / APP_PORT).
+    # `uvicorn main:app --reload --port 8000` still works as before.
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host=os.getenv("APP_HOST", "0.0.0.0"),
+        port=int(os.getenv("APP_PORT", "8000")),
+        reload=os.getenv("APP_RELOAD", "true").lower() in ("1", "true", "yes"),
+    )

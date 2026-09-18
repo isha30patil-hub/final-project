@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 
-const API_URL = "http://127.0.0.1:8000";
+// Backend base URL from Software testing/frontend/.env (VITE_API_URL). Restart `npm run dev` after editing.
+const API_URL = (import.meta.env.VITE_API_URL ?? "").trim().replace(/\/+$/, "");
+if (!API_URL) console.error("VITE_API_URL is not set. Copy .env.example to .env and set it.");
 
 function App() {
   const [projectName, setProjectName] = useState("");

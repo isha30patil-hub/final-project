@@ -29,7 +29,7 @@ export const Route = createFileRoute("/_app/projects")({
   component: ProjectsPage,
 });
 
-const API_URL = "http://localhost:8000";
+import { API_URL } from "@/lib/api";
 
 type Project = {
   id: number;

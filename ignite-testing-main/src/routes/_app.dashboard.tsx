@@ -38,7 +38,7 @@ export const Route = createFileRoute("/_app/dashboard")({
   component: Dashboard,
 });
 
-const API_URL = "http://127.0.0.1:8000";
+import { API_URL } from "@/lib/api";
 
 type ModuleFailure = {
   module: string;
