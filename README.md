@@ -135,6 +135,10 @@ uvicorn main:app --reload --port 8000
 ```
 
 The API is now at **http://127.0.0.1:8000** (interactive docs at `/docs`).
+Alternatively `python main.py` starts it using `APP_HOST` / `APP_PORT` / `APP_RELOAD`
+from `.env`. `CORS_ORIGINS` (comma-separated, default `*`) controls which frontend
+origins may call the API, and `GEMINI_API_BASE_URL` sets the Gemini endpoint — all
+external URLs live in `.env`, none in code.
 
 > `--reload` only watches `.py` files. **Editing `.env` does not restart the server** —
 > after changing an API key or any other env value, stop it (`Ctrl+C`) and start it
@@ -158,9 +162,17 @@ Vite will print the local URL it picked (commonly **http://localhost:8080**, but
 auto-increments if that port is busy — check your terminal output). Open that URL in
 your browser; the page title is **"TestAI — Automated Test Case Generation and Monitoring"**.
 
-The frontend expects the backend at `http://127.0.0.1:8000` (set in
-[`src/lib/api.ts`](ignite-testing-main/src/lib/api.ts) — change it there if you run the
-API elsewhere).
+The frontend reads the backend URL from `ignite-testing-main/.env` — there are no
+hardcoded URLs in the code. Create it once:
+
+```bash
+cp .env.example .env      # inside ignite-testing-main
+```
+
+and set `VITE_API_URL` to wherever the API is running (default `http://127.0.0.1:8000`,
+no trailing slash). The WebSocket URL is derived from it automatically. Vite only reads
+`.env` at startup, so **restart `npm run dev` after changing it**. If it is missing, the
+browser console shows a `VITE_API_URL is not set` error and every request fails.
 
 **Login:** the app has a demo login gate. Use the **Quick Login as Tester** /
 **Quick Login as Project Manager** buttons, or sign in with

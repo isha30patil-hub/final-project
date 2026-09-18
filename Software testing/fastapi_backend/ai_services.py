@@ -26,6 +26,9 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5").strip()
 
 MAX_COVERAGE_ITERATIONS = int(os.getenv("MAX_COVERAGE_ITERATIONS", "2"))
 
+# Base URL of the Gemini REST API (set in .env). No trailing slash.
+GEMINI_API_BASE_URL = os.getenv("GEMINI_API_BASE_URL", "").strip().rstrip("/")
+
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
@@ -41,8 +44,10 @@ def generate_ai_response(prompt: str) -> str:
     if AI_PROVIDER == "gemini":
         if not GEMINI_API_KEY:
             raise Exception("Gemini API key is missing")
+        if not GEMINI_API_BASE_URL:
+            raise Exception("GEMINI_API_BASE_URL is not set in .env")
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+        url = f"{GEMINI_API_BASE_URL}/models/{GEMINI_MODEL}:generateContent"
         headers = {
             "Content-Type": "application/json",
             "x-goog-api-key": GEMINI_API_KEY,

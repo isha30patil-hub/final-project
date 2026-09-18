@@ -36,7 +36,7 @@ export const Route = createFileRoute("/_app/defects")({
   component: DefectsPage,
 });
 
-const API_URL = "http://localhost:8000";
+import { API_URL } from "@/lib/api";
 
 type Defect = {
   id: number;
