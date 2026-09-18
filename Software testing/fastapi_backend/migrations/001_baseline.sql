@@ -1,7 +1,12 @@
+-- Baseline: the full schema as of the execution pipeline.
+-- Every statement is idempotent, so this is safe against an empty database
+-- and against any database created from an older version of the schema.
+
 CREATE TABLE IF NOT EXISTS projects (
     id SERIAL PRIMARY KEY,
     name TEXT NOT NULL,
     description TEXT,
+    base_url TEXT,
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
@@ -27,7 +32,13 @@ CREATE TABLE IF NOT EXISTS testcases (
     ai_recommendation VARCHAR(20),
     approved_at TIMESTAMP,
     solved_at TIMESTAMP,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    latest_execution_status VARCHAR(20),
+    latest_execution_id INTEGER,
+    ai_test_case JSONB,
+    role VARCHAR(50),
+    automatable BOOLEAN NOT NULL DEFAULT FALSE,
+    requires_credentials BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE TABLE IF NOT EXISTS defects (
@@ -49,18 +60,28 @@ CREATE TABLE IF NOT EXISTS test_runs (
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
--- Execution pipeline tables (added for automated Playwright execution).
--- Kept in sync by hand with ensure_execution_schema() in main.py.
-
-ALTER TABLE projects ADD COLUMN IF NOT EXISTS base_url TEXT;
+-- Columns added after the tables above first shipped. CREATE TABLE IF NOT EXISTS
+-- does nothing on a table that already exists, so older databases pick them up here.
+ALTER TABLE projects
+    ADD COLUMN IF NOT EXISTS base_url TEXT,
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW();
 
 ALTER TABLE testcases
+    ADD COLUMN IF NOT EXISTS module VARCHAR(100) DEFAULT 'General',
+    ADD COLUMN IF NOT EXISTS coverage_type VARCHAR(50),
+    ADD COLUMN IF NOT EXISTS ai_quality_score INTEGER,
+    ADD COLUMN IF NOT EXISTS ai_review_remark TEXT,
+    ADD COLUMN IF NOT EXISTS ai_recommendation VARCHAR(20),
+    ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS solved_at TIMESTAMP,
     ADD COLUMN IF NOT EXISTS latest_execution_status VARCHAR(20),
     ADD COLUMN IF NOT EXISTS latest_execution_id INTEGER,
     ADD COLUMN IF NOT EXISTS ai_test_case JSONB,
     ADD COLUMN IF NOT EXISTS role VARCHAR(50),
     ADD COLUMN IF NOT EXISTS automatable BOOLEAN NOT NULL DEFAULT FALSE,
     ADD COLUMN IF NOT EXISTS requires_credentials BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Execution pipeline (automated Playwright runs).
 
 CREATE TABLE IF NOT EXISTS generated_scripts (
     id SERIAL PRIMARY KEY,
